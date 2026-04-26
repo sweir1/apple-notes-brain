@@ -1,6 +1,6 @@
 [project]
 name = "apple-notes-brain"
-version = "1.0.0"
+version = "1.0.1"
 description = "MCP server for Apple Notes on macOS — read, write, and search with full Markdown round-trip. Reads via SQLite (sub-100ms, concurrent with Notes.app), writes via AppleScript (preserves iCloud sync). Part of the -brain family."
 readme = "README.md"
 requires-python = ">=3.11"

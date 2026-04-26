@@ -110,7 +110,9 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Set up uv + Python
-        uses: astral-sh/setup-uv@v8
+        # SHA-pinned per setup-uv's own docs (immutable, supply-chain safe).
+        # Comment denotes the human-readable version; bump both together.
+        uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b # v8.1.0
         with:
           python-version: "3.11"
           enable-cache: true
@@ -134,7 +136,9 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Set up uv
-        uses: astral-sh/setup-uv@v8
+        # Pin to specific version: setup-uv ships immutable per-version tags
+        # (no rolling major-version tag). Bump manually for new versions.
+        uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b # v8.1.0
         with:
           python-version: "3.11"
           enable-cache: true

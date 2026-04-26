@@ -375,7 +375,6 @@ src/notes_mcp/
 
 - [`obsidian-brain`](https://github.com/sweir1/obsidian-brain) — sibling MCP
   server for Obsidian vaults: semantic search, knowledge graph, vault editing.
-- [Model Context Protocol](https://modelcontextprotocol.io/) — the protocol spec.
 - [`modelcontextprotocol/python-sdk`](https://github.com/modelcontextprotocol/python-sdk) —
   the official MCP Python SDK this server is built on (provides the `FastMCP`
   class at `mcp.server.fastmcp`).
