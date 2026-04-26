@@ -262,9 +262,9 @@ Restart Claude Desktop. On first use macOS will prompt for:
 Grant both. The Automation prompt is sticky once approved; Full Disk Access
 is granted in System Settings → Privacy & Security → Full Disk Access.
 
-### Known issue: Full Disk Access + `uvx`-managed Python on macOS
+### Known issue: Full Disk Access on macOS
 
-If after install Claude Desktop's logs show:
+If Claude Desktop's logs show:
 
 ```
 could not pre-populate recent notes: cannot open NoteStore (unable to open database file).
@@ -272,44 +272,21 @@ apple-notes-brain registered 0 recent notes as resources
 ```
 
 …and SQLite-backed tools (`list_folders`, `search_notes`, `list_notes`) return
-empty results — but AppleScript-backed tools (`create_note`, `delete_note`)
-work — then macOS Full Disk Access has been granted to Claude Desktop but is
-**not propagating to the uv-managed Python interpreter** that `uvx` spawns.
+empty results, then `uvx` doesn't have Full Disk Access. The process chain is
+**Claude.app → `uvx` → Python**, and Full Disk Access on `uvx` propagates
+down the chain.
 
-This is a known macOS TCC quirk: when `uvx` runs, it executes a Python from
-`~/.local/share/uv/python/cpython-X.Y.Z-…/bin/python` — a Python that uv
-downloaded from `python-build-standalone`. macOS treats this as a separately
-attributable binary and doesn't always honor inherited FDA from the parent.
+**Fix:**
 
-**Fix — try in this order, simplest first:**
+1. System Settings → Privacy & Security → Full Disk Access → `+` →
+   `Cmd+Shift+G` → paste `/usr/local/bin/uvx` → Open → toggle on.
+2. Quit and relaunch Claude Desktop.
 
-1. **FDA on `uvx` itself** (recommended first attempt). uvx is the parent of
-   the python process; FDA on it should propagate to its python child. uvx is
-   properly signed by Astral, so it appears normally in the FDA picker (no
-   gray-out problems).
-   - System Settings → Privacy & Security → Full Disk Access → `+` →
-     `Cmd+Shift+G` → paste `/usr/local/bin/uvx` → Open → toggle on.
-   - Do the same for `/usr/local/bin/uv` while you're there.
-   - Quit and relaunch Claude Desktop. If SQLite reads work, you're done.
-
-2. **FDA on the uv-managed Python directly** (if step 1 wasn't enough). The
-   tricky part: the FDA file picker GRAYS OUT this Python because uv's
-   bundled interpreter is ad-hoc signed. Use **drag-and-drop** to bypass
-   the picker's filter:
-   - Find the path: `ls -d ~/.local/share/uv/python/cpython-*/bin/`
-   - Open Finder, press `Cmd+Shift+G`, paste that path.
-   - **Drag** the `python3` file from Finder **directly onto the FDA list
-     pane** in System Settings. (Don't use the `+` button — it filters out
-     ad-hoc-signed binaries.)
-   - The new entry appears with a toggle — flip it on.
-   - Quit and relaunch Claude Desktop.
-
-The Python path may change when uv updates the Python interpreter (e.g. after
-`uv self update` or a major version bump). If SQLite reads stop working
-after a uv update, redo step 2 for the new path.
+(Claude.app should also have FDA toggled on — that's the standard MCP
+client requirement.)
 
 For new users on macOS, the [install script](./scripts/install.sh) walks
-through both options automatically in the right order.
+through this automatically.
 
 ## Other MCP clients
 
