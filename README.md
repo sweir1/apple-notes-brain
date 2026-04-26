@@ -276,30 +276,40 @@ empty results — but AppleScript-backed tools (`create_note`, `delete_note`)
 work — then macOS Full Disk Access has been granted to Claude Desktop but is
 **not propagating to the uv-managed Python interpreter** that `uvx` spawns.
 
-This is a known macOS TCC quirk: when `uvx` runs, it executes a Python binary
-from `~/.local/share/uv/python/cpython-X.Y.Z-…/bin/python` (a Python that uv
-downloaded from `python-build-standalone`). macOS treats this as a separately
-attributable binary and doesn't always honor inherited FDA from the parent
-process.
+This is a known macOS TCC quirk: when `uvx` runs, it executes a Python from
+`~/.local/share/uv/python/cpython-X.Y.Z-…/bin/python` — a Python that uv
+downloaded from `python-build-standalone`. macOS treats this as a separately
+attributable binary and doesn't always honor inherited FDA from the parent.
 
-**Fix:** grant Full Disk Access to the uv-managed Python directly.
+**Fix — try in this order, simplest first:**
 
-1. Find the active path:
-   ```bash
-   uv python find
-   ```
-   Output looks like `/Users/<you>/.local/share/uv/python/cpython-3.13.X-macos-aarch64-none/bin/python`.
-2. Open **System Settings → Privacy & Security → Full Disk Access**.
-3. Click `+`, press `Cmd+Shift+G`, paste the path from step 1, hit return,
-   select the `python` binary, click Open, and toggle it **on**.
-4. Quit and relaunch Claude Desktop.
+1. **FDA on `uvx` itself** (recommended first attempt). uvx is the parent of
+   the python process; FDA on it should propagate to its python child. uvx is
+   properly signed by Astral, so it appears normally in the FDA picker (no
+   gray-out problems).
+   - System Settings → Privacy & Security → Full Disk Access → `+` →
+     `Cmd+Shift+G` → paste `/usr/local/bin/uvx` → Open → toggle on.
+   - Do the same for `/usr/local/bin/uv` while you're there.
+   - Quit and relaunch Claude Desktop. If SQLite reads work, you're done.
 
-The path may change when uv updates the Python interpreter (e.g. after
+2. **FDA on the uv-managed Python directly** (if step 1 wasn't enough). The
+   tricky part: the FDA file picker GRAYS OUT this Python because uv's
+   bundled interpreter is ad-hoc signed. Use **drag-and-drop** to bypass
+   the picker's filter:
+   - Find the path: `ls -d ~/.local/share/uv/python/cpython-*/bin/`
+   - Open Finder, press `Cmd+Shift+G`, paste that path.
+   - **Drag** the `python3` file from Finder **directly onto the FDA list
+     pane** in System Settings. (Don't use the `+` button — it filters out
+     ad-hoc-signed binaries.)
+   - The new entry appears with a toggle — flip it on.
+   - Quit and relaunch Claude Desktop.
+
+The Python path may change when uv updates the Python interpreter (e.g. after
 `uv self update` or a major version bump). If SQLite reads stop working
-after a uv update, redo the FDA grant for the new path.
+after a uv update, redo step 2 for the new path.
 
-For new users on macOS, the [install script](./scripts/install.sh) handles
-this walkthrough automatically.
+For new users on macOS, the [install script](./scripts/install.sh) walks
+through both options automatically in the right order.
 
 ## Other MCP clients
 

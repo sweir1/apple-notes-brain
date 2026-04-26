@@ -306,34 +306,64 @@ FDA_URL_MODERN="x-apple.systempreferences:com.apple.settings.PrivacySecurity.ext
 FDA_URL_LEGACY="x-apple.systempreferences:com.apple.preference.security?Privacy_AllFiles"
 open "$FDA_URL_MODERN" 2>/dev/null || open "$FDA_URL_LEGACY" 2>/dev/null || open -a "System Settings" || warn "Couldn't open System Settings automatically — open it manually."
 
+UV_PY_DIR="$(dirname "$UV_PY")"
 cat <<EOF
-In the Full Disk Access list, you need ${C_BOLD}TWO${C_RESET} entries toggled ${C_BOLD}ON${C_RESET}:
+You need to toggle ${C_BOLD}three${C_RESET} entries ${C_BOLD}ON${C_RESET} in the Full Disk Access list. Try
+them in this order — if SQLite reads work after the first two, you can skip
+the third.
 
   ${C_BOLD}1. Claude${C_RESET} (the app)
      - If listed → flip its toggle ON.
      - If not listed → click ${C_BOLD}+${C_RESET}, choose Applications → Claude.app, toggle ON.
 
-  ${C_BOLD}2. The uv-managed Python interpreter${C_RESET} (the one uvx runs)
-     - Click ${C_BOLD}+${C_RESET} in the FDA list.
-     - Press ${C_BOLD}Cmd+Shift+G${C_RESET} (Go to Folder).
-     - Paste this exact path:
+  ${C_BOLD}2. uvx${C_RESET} (the wrapper that spawns Python)
+     - Click ${C_BOLD}+${C_RESET}, press ${C_BOLD}Cmd+Shift+G${C_RESET}, paste:
 
-         ${C_CYAN}$UV_PY${C_RESET}
+         ${C_CYAN}/usr/local/bin/uvx${C_RESET}
 
-     - Press Enter. The Python binary will be highlighted.
-     - Click ${C_BOLD}Open${C_RESET}, then toggle the new entry ${C_BOLD}ON${C_RESET}.
+     - Press Enter, click ${C_BOLD}Open${C_RESET}, then toggle ON. While you're there, do
+       the same for ${C_CYAN}/usr/local/bin/uv${C_RESET} too — same procedure.
+     - These are signed Astral binaries — they appear normally in the picker,
+       no gray-out. macOS TCC ${C_BOLD}should${C_RESET} propagate this FDA grant down to the
+       python child uvx spawns.
 
-If you skip step 2, Claude Desktop will load the server but SQLite-backed
-tools (list_folders, search_notes, list_notes) will return empty results, and
-the logs will show "cannot open NoteStore (unable to open database file)".
+  After steps 1 and 2: ${C_BOLD}quit and relaunch Claude Desktop${C_RESET}, then ask it to
+  list your notes. If you see notes returned, you're done — skip step 3.
+
+  ${C_BOLD}3. The uv-managed Python${C_RESET} (only if step 2 wasn't enough)
+
+     ${C_YELLOW}Heads-up:${C_RESET} this Python is grayed out in the picker. uv's bundled
+     Python is ad-hoc signed, and macOS's FDA file picker rejects
+     ad-hoc-signed Mach-O binaries. Use ${C_BOLD}drag-and-drop${C_RESET} instead.
+
+     Steps (keep the FDA pane open):
+       a. Switch to Finder (or open one with Cmd+N).
+       b. In Finder, press ${C_BOLD}Cmd+Shift+G${C_RESET} (Go to Folder).
+       c. Paste this directory path:
+
+            ${C_CYAN}$UV_PY_DIR${C_RESET}
+
+       d. Press Enter. Finder shows the bin/ contents.
+       e. ${C_BOLD}Drag${C_RESET} the file ${C_BOLD}python3${C_RESET} (the real binary near the bottom — NOT
+          the symlinks above it) from Finder ${C_BOLD}directly onto the Full Disk
+          Access list pane${C_RESET} in System Settings.
+       f. The new entry appears with a toggle — flip it ON.
+
+     If drag-and-drop fails too: in the FDA ${C_BOLD}+${C_RESET} picker, paste the path with
+     Cmd+Shift+G, then ${C_BOLD}type${C_RESET} ${C_BOLD}python3${C_RESET} into the filename bar and press Enter.
+     Some macOS builds let typed names bypass the gray-out filter.
+
+  If after all three you still see "cannot open NoteStore" — check
+  https://github.com/sweir1/apple-notes-brain/issues for the latest workaround.
 
 The Python path may change when uv updates its bundled Python (e.g. after
-${C_DIM}uv self update${C_RESET}). If reads stop working after that, redo step 2 with
-the new path from ${C_DIM}uv python find${C_RESET}.
+${C_DIM}uv self update${C_RESET}). If reads stop working after that, redo step 3 with
+the new path:
+   ${C_DIM}ls -d ~/.local/share/uv/python/cpython-*/bin/python3${C_RESET}
 
 EOF
 
-pause_enter "Press Enter once both Claude AND the Python binary are toggled ON in Full Disk Access..."
+pause_enter "Press Enter once Claude + uvx are toggled ON in Full Disk Access (and python too if step 2 wasn't enough)..."
 
 ok "Continuing — Full Disk Access checked off"
 
