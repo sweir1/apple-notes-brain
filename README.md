@@ -176,6 +176,22 @@ decrypts and never peeks:
 
 Requires **macOS**, **Python 3.11+**, and **Apple Notes**.
 
+### One-line macOS installer (recommended)
+
+Handles uv install, the `/usr/local/bin` PATH symlinks Claude Desktop needs,
+the Claude Desktop config merge (preserves your other MCP servers), the
+Full Disk Access walkthrough for **both** Claude.app **and** the uv-managed
+Python (the cached-Python TCC quirk that breaks SQLite reads — see [Known
+issue](#known-issue-full-disk-access--uvx-managed-python-on-macos) below),
+and the Automation prompt heads-up.
+
+```bash
+/bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/sweir1/apple-notes-brain/main/scripts/install.sh)"
+```
+
+Idempotent — safe to re-run if you change your mind, hit a TCC mismatch,
+or want to update.
+
 ### Quickest — `uvx` (no install)
 
 ```bash
@@ -245,6 +261,45 @@ Restart Claude Desktop. On first use macOS will prompt for:
 
 Grant both. The Automation prompt is sticky once approved; Full Disk Access
 is granted in System Settings → Privacy & Security → Full Disk Access.
+
+### Known issue: Full Disk Access + `uvx`-managed Python on macOS
+
+If after install Claude Desktop's logs show:
+
+```
+could not pre-populate recent notes: cannot open NoteStore (unable to open database file).
+apple-notes-brain registered 0 recent notes as resources
+```
+
+…and SQLite-backed tools (`list_folders`, `search_notes`, `list_notes`) return
+empty results — but AppleScript-backed tools (`create_note`, `delete_note`)
+work — then macOS Full Disk Access has been granted to Claude Desktop but is
+**not propagating to the uv-managed Python interpreter** that `uvx` spawns.
+
+This is a known macOS TCC quirk: when `uvx` runs, it executes a Python binary
+from `~/.local/share/uv/python/cpython-X.Y.Z-…/bin/python` (a Python that uv
+downloaded from `python-build-standalone`). macOS treats this as a separately
+attributable binary and doesn't always honor inherited FDA from the parent
+process.
+
+**Fix:** grant Full Disk Access to the uv-managed Python directly.
+
+1. Find the active path:
+   ```bash
+   uv python find
+   ```
+   Output looks like `/Users/<you>/.local/share/uv/python/cpython-3.13.X-macos-aarch64-none/bin/python`.
+2. Open **System Settings → Privacy & Security → Full Disk Access**.
+3. Click `+`, press `Cmd+Shift+G`, paste the path from step 1, hit return,
+   select the `python` binary, click Open, and toggle it **on**.
+4. Quit and relaunch Claude Desktop.
+
+The path may change when uv updates the Python interpreter (e.g. after
+`uv self update` or a major version bump). If SQLite reads stop working
+after a uv update, redo the FDA grant for the new path.
+
+For new users on macOS, the [install script](./scripts/install.sh) handles
+this walkthrough automatically.
 
 ## Other MCP clients
 
