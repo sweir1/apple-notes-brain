@@ -1,0 +1,261 @@
+# =============================================================================
+# apple-notes-brain — .gitignore
+# =============================================================================
+
+# -----------------------------------------------------------------------------
+# Python — bytecode & build artifacts
+# -----------------------------------------------------------------------------
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# Distribution / packaging
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# PyInstaller
+*.manifest
+*.spec
+
+# Installer logs
+pip-log.txt
+pip-delete-this-directory.txt
+
+# -----------------------------------------------------------------------------
+# Virtual environments (incl. uv)
+# -----------------------------------------------------------------------------
+.venv/
+.venv-*/
+venv/
+ENV/
+env/
+env.bak/
+venv.bak/
+.python-version
+
+# uv-specific
+.uv/
+
+# -----------------------------------------------------------------------------
+# Test, coverage, and linter caches
+# -----------------------------------------------------------------------------
+.pytest_cache/
+.cache/
+.coverage
+.coverage.*
+coverage.xml
+*.cover
+*.py,cover
+htmlcov/
+.tox/
+.nox/
+.hypothesis/
+.mypy_cache/
+.dmypy.json
+dmypy.json
+.pyre/
+.pytype/
+.ruff_cache/
+.pylint.d/
+nosetests.xml
+
+# -----------------------------------------------------------------------------
+# Documentation builds
+# -----------------------------------------------------------------------------
+docs/_build/
+site/
+
+# -----------------------------------------------------------------------------
+# Jupyter / IPython
+# -----------------------------------------------------------------------------
+.ipynb_checkpoints/
+*.ipynb_checkpoints
+profile_default/
+ipython_config.py
+
+# -----------------------------------------------------------------------------
+# Editors / IDEs
+# -----------------------------------------------------------------------------
+# VS Code
+.vscode/
+*.code-workspace
+
+# JetBrains (PyCharm, IntelliJ, etc.)
+.idea/
+*.iml
+*.ipr
+*.iws
+
+# Sublime
+*.sublime-project
+*.sublime-workspace
+
+# Vim / Neovim
+*.swp
+*.swo
+*.swn
+*~
+.netrwhist
+Session.vim
+.vim/
+
+# Emacs
+\#*\#
+.\#*
+.emacs.desktop
+.emacs.desktop.lock
+auto-save-list/
+tramp
+
+# Cursor / Zed / other modern editors
+.cursor/
+.zed/
+
+# -----------------------------------------------------------------------------
+# macOS system files
+# -----------------------------------------------------------------------------
+.DS_Store
+.AppleDouble
+.LSOverride
+Icon
+._*
+.DocumentRevisions-V100
+.fseventsd
+.Spotlight-V100
+.TemporaryItems
+.Trashes
+.VolumeIcon.icns
+.com.apple.timemachine.donotpresent
+.AppleDB
+.AppleDesktop
+Network Trash Folder
+Temporary Items
+.apdisk
+
+# -----------------------------------------------------------------------------
+# Linux / Windows artifacts (in case anyone forks on another OS)
+# -----------------------------------------------------------------------------
+.directory
+.Trash-*
+.nfs*
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+$RECYCLE.BIN/
+*.lnk
+
+# -----------------------------------------------------------------------------
+# Logs & debug output
+# -----------------------------------------------------------------------------
+*.log
+logs/
+log/
+debug.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+*.log.*
+crash.log
+
+# -----------------------------------------------------------------------------
+# Secrets & local-only config — NEVER commit these
+# -----------------------------------------------------------------------------
+.env
+.env.*
+!.env.example
+!.env.template
+.envrc
+secrets.json
+secrets.yaml
+credentials.json
+credentials.yaml
+*.pem
+*.key
+*.cert
+*.crt
+*.p12
+*.pfx
+auth.json
+.authinfo
+.netrc
+
+# Claude Desktop / Claude Code configs (contain absolute paths)
+claude_desktop_config.json
+claude_desktop_config.*.json
+.claude/
+.mcp.json
+
+# -----------------------------------------------------------------------------
+# Local databases / SQLite copies (forensic exports of NoteStore.sqlite, etc.)
+# -----------------------------------------------------------------------------
+*.db
+*.db-journal
+*.sqlite
+*.sqlite-journal
+*.sqlite-wal
+*.sqlite-shm
+*.sqlite3
+NoteStore*.sqlite*
+note_store_copy/
+notestore_dump/
+
+# -----------------------------------------------------------------------------
+# Scratch / ad-hoc test scripts (avoid committing throwaway probes)
+# -----------------------------------------------------------------------------
+scratch/
+scratch_*.py
+probe_*.py
+tmp/
+temp/
+tmp_*/
+.scratch/
+*.scratch.*
+
+# -----------------------------------------------------------------------------
+# Build / release artifacts (PyPI, MCP Registry)
+# -----------------------------------------------------------------------------
+*.tar.gz
+*.whl
+dist-*/
+build-*/
+
+# -----------------------------------------------------------------------------
+# Profiling / performance traces
+# -----------------------------------------------------------------------------
+*.prof
+*.lprof
+*.profraw
+profile_output/
+.benchmarks/
+
+# -----------------------------------------------------------------------------
+# Note: src/notes_mcp/proto/notestore_pb2.py IS checked in deliberately —
+# downstream users shouldn't need protoc to install. Don't add *_pb2.py to
+# this file.
+# -----------------------------------------------------------------------------
+
+# -----------------------------------------------------------------------------
+# Misc
+# -----------------------------------------------------------------------------
+*.bak
+*.orig
+*.rej
+*.tmp
+node_modules/

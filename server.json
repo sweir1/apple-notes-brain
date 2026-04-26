@@ -1,0 +1,49 @@
+{
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
+  "name": "io.github.sweir1/apple-notes-brain",
+  "title": "Apple Notes Brain",
+  "description": "Apple Notes MCP server: read, write, and search Apple Notes on macOS with full Markdown round-trip. Reads via SQLite (sub-100ms, concurrent with Notes.app), writes via AppleScript (preserves iCloud sync). No plugin or fork required.",
+  "repository": {
+    "url": "https://github.com/sweir1/apple-notes-brain",
+    "source": "github"
+  },
+  "version": "0.1.0",
+  "packages": [
+    {
+      "registryType": "pypi",
+      "identifier": "apple-notes-brain",
+      "version": "0.1.0",
+      "runtimeHint": "uvx",
+      "transport": {
+        "type": "stdio"
+      },
+      "environmentVariables": [
+        {
+          "name": "NOTES_MCP_AUTO_REFRESH",
+          "description": "Set to '0' to disable the background auto-refresh thread that pings Notes.app to keep the SQLite cache fresh while the MCP client is active. Default '1' (enabled).",
+          "isRequired": false,
+          "format": "string",
+          "default": "1",
+          "choices": [
+            "0",
+            "1"
+          ]
+        },
+        {
+          "name": "NOTES_MCP_REFRESH_INTERVAL",
+          "description": "Background auto-refresh cadence in seconds (default 4, minimum 1). Lower = fresher reads of edits made outside the MCP, higher CPU. Has no effect on writes (those auto-flush regardless).",
+          "isRequired": false,
+          "format": "number",
+          "default": "4"
+        },
+        {
+          "name": "NOTES_MCP_IDLE_THRESHOLD",
+          "description": "Seconds of MCP-tool inactivity before the background auto-refresh pauses (default 300 = 5 minutes). Set to 0 to disable idle pausing entirely. Next tool call instantly wakes the refresher.",
+          "isRequired": false,
+          "format": "number",
+          "default": "300"
+        }
+      ]
+    }
+  ]
+}

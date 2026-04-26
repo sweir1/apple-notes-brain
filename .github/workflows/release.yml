@@ -1,0 +1,192 @@
+# Release workflow — publishes apple-notes-brain to PyPI on tag push.
+#
+# Triggered by: pushing a tag matching v* (e.g. v0.1.0).
+#
+# Hard guarantees enforced here:
+#   1. The tagged commit MUST be reachable from main (verified via
+#      git merge-base --is-ancestor). A tag pointing at any other branch
+#      fails the workflow before tests, build, or publish run.
+#   2. pyproject.toml version, server.json version, and the tag MUST agree.
+#   3. The full unit-test suite MUST pass.
+#   4. The publish step runs in GitHub Environment "pypi" — configure
+#      that environment with:
+#        - Required reviewers: yourself (manual approval gate)
+#        - Deployment branches and tags: pattern `v*` only
+#      Without those, the publish auto-runs after build. With them, you
+#      get an explicit "approve deployment" click in the GitHub UI before
+#      anything reaches PyPI.
+#
+# On PyPI side, configure a Trusted Publisher pointing at:
+#   - Owner: sweir1
+#   - Repository: apple-notes-brain
+#   - Workflow filename: release.yml
+#   - Environment name: pypi
+# Once configured, this workflow publishes via OIDC — no API tokens needed.
+
+name: Release to PyPI
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+# Default-deny all permissions at workflow level; each job opts in to what it
+# actually needs. This is the principle-of-least-privilege baseline.
+permissions: {}
+
+# Don't cancel an in-flight release if a second tag is pushed; let the first
+# finish (or fail) before the second starts.
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  # ----------------------------------------------------------------------
+  # Job 1 — Hard gate: tag must be on main + versions must agree.
+  # If this job fails, nothing downstream runs.
+  # ----------------------------------------------------------------------
+  verify:
+    name: Verify tag + versions
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Check out at tagged commit (full history)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # need full history for merge-base check
+
+      - name: Refuse if tagged commit is not on main
+        run: |
+          set -euo pipefail
+          git fetch origin main:refs/remotes/origin/main
+          if ! git merge-base --is-ancestor "${{ github.sha }}" origin/main; then
+            echo "::error title=Tag not on main::Tag ${{ github.ref_name }} points at commit ${{ github.sha }} which is NOT reachable from origin/main. Refusing to release."
+            exit 1
+          fi
+          echo "✓ Tag ${{ github.ref_name }} (${{ github.sha }}) is reachable from main"
+
+      - name: Verify pyproject.toml version matches tag
+        run: |
+          set -euo pipefail
+          tag_version="${GITHUB_REF_NAME#v}"
+          pyproject_version=$(python3 -c "import tomllib; print(tomllib.load(open('pyproject.toml','rb'))['project']['version'])")
+          if [ "$tag_version" != "$pyproject_version" ]; then
+            echo "::error title=Version mismatch::Tag is v${tag_version} but pyproject.toml has version=${pyproject_version}"
+            exit 1
+          fi
+          echo "✓ Tag and pyproject.toml versions match: ${tag_version}"
+
+      - name: Verify server.json versions match tag
+        run: |
+          set -euo pipefail
+          tag_version="${GITHUB_REF_NAME#v}"
+          server_top=$(python3 -c "import json; print(json.load(open('server.json'))['version'])")
+          server_pkg=$(python3 -c "import json; print(json.load(open('server.json'))['packages'][0]['version'])")
+          if [ "$tag_version" != "$server_top" ] || [ "$tag_version" != "$server_pkg" ]; then
+            echo "::error title=server.json version mismatch::tag=v${tag_version}, server.json top=${server_top}, packages[0]=${server_pkg}"
+            exit 1
+          fi
+          echo "✓ server.json versions match: ${tag_version}"
+          echo "::warning title=server.json env vars::Reminder: server.json environmentVariables are NOT auto-synced. If you added new env vars in code since the last release, hand-edit server.json before tagging."
+
+  # ----------------------------------------------------------------------
+  # Job 2 — Run the unit test suite.
+  # Live tests (-m live) are excluded by pyproject default; CI runs only
+  # the mocked unit tests. Live tests need real Notes.app + iCloud and
+  # cannot run on a Linux runner.
+  # ----------------------------------------------------------------------
+  test:
+    name: Tests
+    needs: verify
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up uv + Python
+        uses: astral-sh/setup-uv@v8
+        with:
+          python-version: "3.11"
+          enable-cache: true
+
+      - name: Install dependencies
+        run: uv sync --extra dev
+
+      - name: Run pytest
+        run: uv run pytest -q
+
+  # ----------------------------------------------------------------------
+  # Job 3 — Build wheel + sdist with uv.
+  # ----------------------------------------------------------------------
+  build:
+    name: Build distributions
+    needs: test
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v8
+        with:
+          python-version: "3.11"
+          enable-cache: true
+
+      - name: Build wheel and sdist
+        run: uv build
+
+      - name: Sanity-check dist/ contents
+        run: |
+          set -euo pipefail
+          ls -la dist/
+          wheel_count=$(ls dist/*.whl 2>/dev/null | wc -l | tr -d ' ')
+          sdist_count=$(ls dist/*.tar.gz 2>/dev/null | wc -l | tr -d ' ')
+          if [ "$wheel_count" != "1" ] || [ "$sdist_count" != "1" ]; then
+            echo "::error title=Bad dist::expected exactly 1 wheel + 1 sdist, got ${wheel_count} wheels + ${sdist_count} sdists"
+            exit 1
+          fi
+          echo "✓ Built ${wheel_count} wheel + ${sdist_count} sdist"
+
+      - name: Upload distributions
+        uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/
+          if-no-files-found: error
+          retention-days: 7
+
+  # ----------------------------------------------------------------------
+  # Job 4 — Publish to PyPI via OIDC trusted publishing.
+  # NO API tokens. Authentication via GitHub OIDC; PyPI verifies the
+  # workflow filename + environment name match the registered Trusted
+  # Publisher (configured at pypi.org/manage/account/publishing).
+  #
+  # The `environment: pypi` block makes GitHub require approval from the
+  # configured reviewers BEFORE this job's steps run — that's your
+  # explicit per-release sign-off gate.
+  # ----------------------------------------------------------------------
+  publish:
+    name: Publish to PyPI
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: pypi
+      url: https://pypi.org/p/apple-notes-brain
+    permissions:
+      id-token: write   # mandatory for OIDC trusted publishing
+    steps:
+      - name: Download distributions
+        uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist/
+
+      - name: Publish to PyPI
+        uses: pypa/gh-action-pypi-publish@release/v1
+        # No `with:` block needed — defaults to:
+        #   - Reading dist/*.whl + dist/*.tar.gz
+        #   - Authenticating via OIDC (because id-token: write is set)
+        #   - Generating PEP 740 attestations automatically
