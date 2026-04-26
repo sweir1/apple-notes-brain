@@ -217,7 +217,9 @@ Edit `~/Library/Application Support/Claude/claude_desktop_config.json`:
   "mcpServers": {
     "apple-notes-brain": {
       "command": "uvx",
-      "args": ["apple-notes-brain"]
+      "args": [
+        "apple-notes-brain"
+      ]
     }
   }
 }
