@@ -99,7 +99,11 @@ jobs:
   test:
     name: Tests
     needs: verify
-    runs-on: ubuntu-latest
+    # Run on macOS to match the production target — Apple Notes only exists
+    # on macOS, and some imports indirectly assume macOS pathing/binaries.
+    # Ubuntu runners would catch a subset but introduce a separate "does it
+    # work on Linux" question that's irrelevant for this server.
+    runs-on: macos-latest
     permissions:
       contents: read
     steps:
