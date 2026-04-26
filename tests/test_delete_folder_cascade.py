@@ -60,6 +60,7 @@ def test_cascade_to_trash_succeeds_when_note_actually_moves():
     with patch("apple_notes_brain.sqlite_reader.note_state_by_zid", side_effect=lambda _: next(states)), \
          patch("apple_notes_brain.sqlite_reader.to_uri", return_value="x-coredata://X/ICNote/p100"), \
          patch("apple_notes_brain.sqlite_reader.store_uuid", return_value="X"), \
+         patch("apple_notes_brain.sqlite_reader.trash_folder_pks", return_value={2}), \
          patch("apple_notes_brain.applescript.run", return_value=""), \
          patch("apple_notes_brain.applescript.quote", return_value='"X"'):
         ok, err = tools._cascade_note_to_trash("zid-abc", 999, timeout_s=1.0)
@@ -72,6 +73,7 @@ def test_cascade_to_trash_detects_silent_lie():
                return_value={"pk": 100, "folder_pk": 999, "marked": 0}), \
          patch("apple_notes_brain.sqlite_reader.to_uri", return_value="x-coredata://X/ICNote/p100"), \
          patch("apple_notes_brain.sqlite_reader.store_uuid", return_value="X"), \
+         patch("apple_notes_brain.sqlite_reader.trash_folder_pks", return_value={2}), \
          patch("apple_notes_brain.applescript.run", return_value="DELETED"), \
          patch("apple_notes_brain.applescript.quote", return_value='"X"'), \
          patch("apple_notes_brain.cache.refresh", return_value={"ok": True, "ms": 1}):
