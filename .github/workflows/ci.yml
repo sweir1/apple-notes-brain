@@ -46,8 +46,8 @@ jobs:
             --cov-report=xml \
             --cov-report=html
 
-      - name: Run MCP smoke tests
-        run: uv run pytest -m integration -v tests/integration/test_mcp_smoke.py
+      - name: Run MCP smoke tests (subset; coverage already measured above)
+        run: uv run pytest --no-cov -m integration -v tests/integration/test_mcp_smoke.py
 
       - name: Verify package builds cleanly
         run: uv build

@@ -372,26 +372,55 @@ Apple provides no formal flush API, so worst-case staleness is one background ti
 ```bash
 git clone https://github.com/sweir1/apple-notes-brain.git
 cd apple-notes-brain
-uv sync
+uv sync --extra dev
 ```
 
-Smoke-test the server boots:
+### Test suite
+
+The project ships with **898 tests** (~65% line coverage). Default test run
+excludes opt-in live tests (those need Notes.app + iCloud + Automation
+permission):
 
 ```bash
-uv run python -m notes_mcp < /dev/null
+uv run pytest                                  # full suite + coverage
+uv run pytest -m integration                   # integration-tier only
+uv run pytest -m property                      # hypothesis property tests
+uv run pytest -m live                          # OPT-IN: real Notes.app
 ```
 
-Run the MCP inspector:
+Coverage report is generated in `htmlcov/` after each run; open
+`htmlcov/index.html` to browse.
+
+### Smoke-test the server boots
 
 ```bash
-uv run --with 'mcp[cli]' mcp dev src/notes_mcp/server.py
+uv run python -m apple_notes_brain < /dev/null   # blocks waiting for MCP traffic; Ctrl-C to exit
 ```
 
-Run the test suite (unit tests only — live tests are opt-in via `-m live`
-and require Notes.app + iCloud):
+Or run the MCP smoke tests (subprocess-spawns the server, exercises the
+JSON-RPC handshake):
 
 ```bash
-uv run pytest
+uv run pytest --no-cov -m integration tests/integration/test_mcp_smoke.py
+```
+
+### Pre-release validation (preflight)
+
+`scripts/preflight.sh` runs locally what CI runs in GitHub Actions, plus
+extras you'd want before tagging a release (`uv build`, `server.json` ↔
+`pyproject.toml` version sync, console-script presence). Idempotent.
+
+```bash
+./scripts/preflight.sh
+# → uv sync, pytest --cov, MCP smoke, uv build, version sync, binary check
+```
+
+If everything's green, you're ready to bump version + tag + push.
+
+### Inspecting tools interactively
+
+```bash
+uv run --with 'mcp[cli]' mcp dev src/apple_notes_brain/server.py
 ```
 
 ## Layout

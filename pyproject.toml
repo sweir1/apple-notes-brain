@@ -129,6 +129,10 @@ omit = [
 precision = 2
 show_missing = true
 skip_covered = false
+# Floor anchored at observed baseline minus ~5pp (currently 65.22% total).
+# Drops below this fail the build; raise it deliberately when coverage climbs.
+# To bypass for a single run: `pytest --cov-fail-under=0`.
+fail_under = 60
 exclude_lines = [
     "pragma: no cover",
     "raise NotImplementedError",
