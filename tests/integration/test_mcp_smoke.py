@@ -59,10 +59,21 @@ def _send_request(proc: subprocess.Popen, msg: dict) -> dict:
 
 @pytest.fixture
 def server_proc():
-    """Spawn the server as a subprocess. Tear down cleanly on exit."""
+    """Spawn the server as a subprocess. Tear down cleanly on exit.
+
+    Sets APPLE_NOTES_BRAIN_NO_PREWARM=1 + NOTES_MCP_AUTO_REFRESH=0 so the
+    server boots without trying to talk to Notes.app via AppleScript.
+    On CI runners (no Notes.app, no Automation permission, no UI), the
+    osascript ping would otherwise hang for the 30s prewarm budget and
+    every smoke test would time out before the first JSON-RPC reply.
+    """
     cmd = _resolve_server_command()
     if cmd is None:
         pytest.skip("no apple-notes-brain command available in venv")
+
+    env = os.environ.copy()
+    env["APPLE_NOTES_BRAIN_NO_PREWARM"] = "1"
+    env["NOTES_MCP_AUTO_REFRESH"] = "0"
 
     proc = subprocess.Popen(
         cmd,
@@ -71,6 +82,7 @@ def server_proc():
         stderr=subprocess.PIPE,
         text=True,
         bufsize=1,  # line-buffered
+        env=env,
     )
     try:
         yield proc

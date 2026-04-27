@@ -27,7 +27,15 @@ def prewarm(timeout_s: float = 30.0) -> bool:
 
     Returns True on success, False on failure (prompt denied, Notes.app not
     installed, osascript missing). Never raises.
+
+    Env var ``APPLE_NOTES_BRAIN_NO_PREWARM=1`` skips the AppleScript ping and
+    returns False immediately. Useful in CI runners and headless environments
+    where Notes.app is unavailable and osascript would block on a permission
+    dialog that nothing can grant.
     """
+    if os.environ.get("APPLE_NOTES_BRAIN_NO_PREWARM") == "1":
+        log.info("AppleScript pre-warm skipped (APPLE_NOTES_BRAIN_NO_PREWARM=1)")
+        return False
     try:
         result = subprocess.run(
             ["osascript", "-e", _PING_SCRIPT],
