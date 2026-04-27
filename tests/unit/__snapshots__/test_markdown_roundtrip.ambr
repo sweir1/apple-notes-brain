@@ -1,0 +1,292 @@
+# serializer version: 1
+# name: test_html_to_markdown_snapshot[01_apple_h1_via_bold_span]
+  '# Heading'
+# ---
+# name: test_html_to_markdown_snapshot[02_apple_h2_via_bold_span_18]
+  '## Sub'
+# ---
+# name: test_html_to_markdown_snapshot[03_apple_h3_via_bold_span_14]
+  '**Subsub**'
+# ---
+# name: test_html_to_markdown_snapshot[04_paragraph]
+  'Plain paragraph.'
+# ---
+# name: test_html_to_markdown_snapshot[05_bold]
+  '**bold** and **also strong**'
+# ---
+# name: test_html_to_markdown_snapshot[06_italic]
+  '*italic* and *also em*'
+# ---
+# name: test_html_to_markdown_snapshot[07_strike]
+  '~~gone~~ and ~~also~~ and ~~removed~~'
+# ---
+# name: test_html_to_markdown_snapshot[08_underline]
+  'underlined'
+# ---
+# name: test_html_to_markdown_snapshot[09_unordered_list]
+  '''
+  - a
+  - b
+  - c
+  '''
+# ---
+# name: test_html_to_markdown_snapshot[10_ordered_list]
+  '''
+  1. 1
+  2. 2
+  '''
+# ---
+# name: test_html_to_markdown_snapshot[11_nested_list]
+  '''
+  - a
+    - a.1
+  '''
+# ---
+# name: test_html_to_markdown_snapshot[12_checklist_checked]
+  '''
+  - [x] done
+  - [ ] todo
+  '''
+# ---
+# name: test_html_to_markdown_snapshot[13_checklist_class_stripped]
+  '''
+  - done
+  - todo
+  '''
+# ---
+# name: test_html_to_markdown_snapshot[14_link_with_href]
+  '[link](https://example.com)'
+# ---
+# name: test_html_to_markdown_snapshot[15_link_no_href]
+  'link without href'
+# ---
+# name: test_html_to_markdown_snapshot[16_inline_code_courier_span]
+  'before `code` after'
+# ---
+# name: test_html_to_markdown_snapshot[17_inline_code_tt]
+  'before code after'
+# ---
+# name: test_html_to_markdown_snapshot[18_code_block_courier_div]
+  '''
+  ```
+  line1
+  line2
+  ```
+  '''
+# ---
+# name: test_html_to_markdown_snapshot[19_code_block_pre]
+  '''
+  ```
+  print(1)
+  print(2)
+  ```
+  '''
+# ---
+# name: test_html_to_markdown_snapshot[20_table_simple]
+  '''
+  |  |  |
+  | --- | --- |
+  | a | b |
+  | c | d |
+  '''
+# ---
+# name: test_html_to_markdown_snapshot[21_table_apple_header]
+  '''
+  | H1 | H2 |
+  | --- | --- |
+  | a | b |
+  '''
+# ---
+# name: test_html_to_markdown_snapshot[22_table_th]
+  '''
+  | H1 | H2 |
+  | --- | --- |
+  | a | b |
+  '''
+# ---
+# name: test_html_to_markdown_snapshot[23_attachment_object]
+  '![attachment](attachment:abc-123)attachment'
+# ---
+# name: test_html_to_markdown_snapshot[24_image_data_url]
+  '![](data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNkYAAAAAYAAjCB0C8AAAAASUVORK5CYII=)'
+# ---
+# name: test_html_to_markdown_snapshot[25_emoji]
+  'Hello 🍎 world'
+# ---
+# name: test_html_to_markdown_snapshot[26_unicode_cjk]
+  '中文测试'
+# ---
+# name: test_html_to_markdown_snapshot[27_blockquote]
+  '> quoted'
+# ---
+# name: test_html_to_markdown_snapshot[28_horizontal_rule]
+  '''
+  before
+  
+  ---
+  
+  after
+  '''
+# ---
+# name: test_html_to_markdown_snapshot[29_entity_amp]
+  'foo & bar <tag> "quoted"'
+# ---
+# name: test_html_to_markdown_snapshot[30_entity_quot_no_semi]
+  'foo"bar'
+# ---
+# name: test_html_to_markdown_snapshot[31_mixed_complex]
+  '''
+  # Title
+  
+  Para with **bold** text and a [link](https://example.com).
+  
+  - first
+  - second
+  
+  ## Subhead
+  
+  1. one
+  2. two
+  '''
+# ---
+# name: test_html_to_markdown_snapshot[32_empty]
+  ''
+# ---
+# name: test_html_to_markdown_snapshot[33_only_whitespace]
+  ''
+# ---
+# name: test_html_to_markdown_snapshot[34_long_paragraph]
+  'Lorem ipsum dolor sit amet. Lorem ipsum dolor sit amet. Lorem ipsum dolor sit amet. Lorem ipsum dolor sit amet. Lorem ipsum dolor sit amet. Lorem ipsum dolor sit amet. Lorem ipsum dolor sit amet. Lorem ipsum dolor sit amet. Lorem ipsum dolor sit amet. Lorem ipsum dolor sit amet. Lorem ipsum dolor sit amet. Lorem ipsum dolor sit amet. Lorem ipsum dolor sit amet. Lorem ipsum dolor sit amet. Lorem ipsum dolor sit amet. Lorem ipsum dolor sit amet. Lorem ipsum dolor sit amet. Lorem ipsum dolor sit amet. Lorem ipsum dolor sit amet. Lorem ipsum dolor sit amet. Lorem ipsum dolor sit amet. Lorem ipsum dolor sit amet. Lorem ipsum dolor sit amet. Lorem ipsum dolor sit amet. Lorem ipsum dolor sit amet. Lorem ipsum dolor sit amet. Lorem ipsum dolor sit amet. Lorem ipsum dolor sit amet. Lorem ipsum dolor sit amet. Lorem ipsum dolor sit amet. Lorem ipsum dolor sit amet. Lorem ipsum dolor sit amet. Lorem ipsum dolor sit amet. Lorem ipsum dolor sit amet. Lorem ipsum dolor sit amet. Lorem ipsum dolor sit amet. Lorem ipsum dolor sit amet. Lorem ipsum dolor sit amet. Lorem ipsum dolor sit amet. Lorem ipsum dolor sit amet. Lorem ipsum dolor sit amet. Lorem ipsum dolor sit amet. Lorem ipsum dolor sit amet. Lorem ipsum dolor sit amet. Lorem ipsum dolor sit amet. Lorem ipsum dolor sit amet. Lorem ipsum dolor sit amet. Lorem ipsum dolor sit amet. Lorem ipsum dolor sit amet. Lorem ipsum dolor sit amet. Lorem ipsum dolor sit amet. Lorem ipsum dolor sit amet. Lorem ipsum dolor sit amet. Lorem ipsum dolor sit amet. Lorem ipsum dolor sit amet. Lorem ipsum dolor sit amet. Lorem ipsum dolor sit amet. Lorem ipsum dolor sit amet. Lorem ipsum dolor sit amet. Lorem ipsum dolor sit amet. Lorem ipsum dolor sit amet. Lorem ipsum dolor sit amet. Lorem ipsum dolor sit amet. Lorem ipsum dolor sit amet. Lorem ipsum dolor sit amet. Lorem ipsum dolor sit amet. Lorem ipsum dolor sit amet. Lorem ipsum dolor sit amet. Lorem ipsum dolor sit amet. Lorem ipsum dolor sit amet. Lorem ipsum dolor sit amet. Lorem ipsum dolor sit amet. Lorem ipsum dolor sit amet. Lorem ipsum dolor sit amet. Lorem ipsum dolor sit amet. Lorem ipsum dolor sit amet. Lorem ipsum dolor sit amet. Lorem ipsum dolor sit amet. Lorem ipsum dolor sit amet. Lorem ipsum dolor sit amet. Lorem ipsum dolor sit amet. Lorem ipsum dolor sit amet. Lorem ipsum dolor sit amet. Lorem ipsum dolor sit amet. Lorem ipsum dolor sit amet. Lorem ipsum dolor sit amet. Lorem ipsum dolor sit amet. Lorem ipsum dolor sit amet. Lorem ipsum dolor sit amet. Lorem ipsum dolor sit amet. Lorem ipsum dolor sit amet. Lorem ipsum dolor sit amet. Lorem ipsum dolor sit amet. Lorem ipsum dolor sit amet. Lorem ipsum dolor sit amet. Lorem ipsum dolor sit amet. Lorem ipsum dolor sit amet. Lorem ipsum dolor sit amet. Lorem ipsum dolor sit amet. Lorem ipsum dolor sit amet. Lorem ipsum dolor sit amet. Lorem ipsum dolor sit amet. Lorem ipsum dolor sit amet. Lorem ipsum dolor sit amet. Lorem ipsum dolor sit amet. Lorem ipsum dolor sit amet. Lorem ipsum dolor sit amet. Lorem ipsum dolor sit amet. Lorem ipsum dolor sit amet. Lorem ipsum dolor sit amet. Lorem ipsum dolor sit amet. Lorem ipsum dolor sit amet. Lorem ipsum dolor sit amet. Lorem ipsum dolor sit amet. Lorem ipsum dolor sit amet. Lorem ipsum dolor sit amet. Lorem ipsum dolor sit amet. Lorem ipsum dolor sit amet. Lorem ipsum dolor sit amet. Lorem ipsum dolor sit amet. Lorem ipsum dolor sit amet. Lorem ipsum dolor sit amet. Lorem ipsum dolor sit amet. Lorem ipsum dolor sit amet. Lorem ipsum dolor sit amet. Lorem ipsum dolor sit amet. Lorem ipsum dolor sit amet. Lorem ipsum dolor sit amet. Lorem ipsum dolor sit amet. Lorem ipsum dolor sit amet. Lorem ipsum dolor sit amet. Lorem ipsum dolor sit amet. Lorem ipsum dolor sit amet. Lorem ipsum dolor sit amet. Lorem ipsum dolor sit amet. Lorem ipsum dolor sit amet. Lorem ipsum dolor sit amet. Lorem ipsum dolor sit amet. Lorem ipsum dolor sit amet. Lorem ipsum dolor sit amet. Lorem ipsum dolor sit amet. Lorem ipsum dolor sit amet. Lorem ipsum dolor sit amet. Lorem ipsum dolor sit amet. Lorem ipsum dolor sit amet. Lorem ipsum dolor sit amet. Lorem ipsum dolor sit amet. Lorem ipsum dolor sit amet. Lorem ipsum dolor sit amet. Lorem ipsum dolor sit amet. Lorem ipsum dolor sit amet. Lorem ipsum dolor sit amet. Lorem ipsum dolor sit amet. Lorem ipsum dolor sit amet. Lorem ipsum dolor sit amet. Lorem ipsum dolor sit amet. Lorem ipsum dolor sit amet. Lorem ipsum dolor sit amet. Lorem ipsum dolor sit amet. Lorem ipsum dolor sit amet. Lorem ipsum dolor sit amet. Lorem ipsum dolor sit amet. Lorem ipsum dolor sit amet. Lorem ipsum dolor sit amet. Lorem ipsum dolor sit amet. Lorem ipsum dolor sit amet. Lorem ipsum dolor sit amet. Lorem ipsum dolor sit amet. Lorem ipsum dolor sit amet. Lorem ipsum dolor sit amet. Lorem ipsum dolor sit amet. Lorem ipsum dolor sit amet. Lorem ipsum dolor sit amet. Lorem ipsum dolor sit amet. Lorem ipsum dolor sit amet. Lorem ipsum dolor sit amet. Lorem ipsum dolor sit amet. Lorem ipsum dolor sit amet. Lorem ipsum dolo'
+# ---
+# name: test_html_to_markdown_snapshot[35_deep_nested_div]
+  'deep'
+# ---
+# name: test_markdown_to_html_snapshot[01_heading_1]
+  '<h1>Heading 1</h1>'
+# ---
+# name: test_markdown_to_html_snapshot[02_heading_2]
+  '<h2>Heading 2</h2>'
+# ---
+# name: test_markdown_to_html_snapshot[03_heading_3]
+  '<h3>Heading 3</h3>'
+# ---
+# name: test_markdown_to_html_snapshot[04_heading_h4_downgraded]
+  '<div>Should downgrade to plain in Apple HTML</div>'
+# ---
+# name: test_markdown_to_html_snapshot[05_bold]
+  '<div><b>bold</b></div>'
+# ---
+# name: test_markdown_to_html_snapshot[06_italic]
+  '<div><i>italic</i></div>'
+# ---
+# name: test_markdown_to_html_snapshot[07_strike]
+  '<div><strike>strikethrough</strike></div>'
+# ---
+# name: test_markdown_to_html_snapshot[08_unordered_list]
+  '''
+  <ul>
+  <li>a</li>
+  <li>b</li>
+  <li>c</li>
+  </ul>
+  '''
+# ---
+# name: test_markdown_to_html_snapshot[09_ordered_list]
+  '''
+  <ol>
+  <li>one</li>
+  <li>two</li>
+  <li>three</li>
+  </ol>
+  '''
+# ---
+# name: test_markdown_to_html_snapshot[10_nested_list]
+  '''
+  <ul>
+  <li>a</li>
+  <li>a.1</li>
+  <li>a.2</li>
+  <li>b</li>
+  </ul>
+  '''
+# ---
+# name: test_markdown_to_html_snapshot[11_checklist]
+  '<ul class="checklist"><li class="checked">done</li><li class="unchecked">todo</li></ul>'
+# ---
+# name: test_markdown_to_html_snapshot[12_link]
+  '<div><a href="https://example.com">text</a></div>'
+# ---
+# name: test_markdown_to_html_snapshot[13_inline_code]
+  '<div>text with <code>code</code> inline</div>'
+# ---
+# name: test_markdown_to_html_snapshot[14_code_block]
+  '''
+  <pre><code>print(1)
+  </code></pre>
+  '''
+# ---
+# name: test_markdown_to_html_snapshot[15_table]
+  '''
+  <table>
+  <thead>
+  <tr>
+  <th>a</th>
+  <th>b</th>
+  </tr>
+  </thead>
+  <tbody>
+  <tr>
+  <td>1</td>
+  <td>2</td>
+  </tr>
+  </tbody>
+  </table>
+  '''
+# ---
+# name: test_markdown_to_html_snapshot[16_blockquote]
+  '''
+  <blockquote>
+  <div>quoted text</div>
+  </blockquote>
+  '''
+# ---
+# name: test_markdown_to_html_snapshot[17_horizontal_rule]
+  '''
+  <div>before</div>
+  <hr />
+  <div>after</div>
+  '''
+# ---
+# name: test_markdown_to_html_snapshot[18_emoji]
+  '<div>Hello 🍎 world</div>'
+# ---
+# name: test_markdown_to_html_snapshot[19_unicode_cjk]
+  '<div>中文 markdown 测试</div>'
+# ---
+# name: test_markdown_to_html_snapshot[20_mixed]
+  '''
+  <h1>Title</h1>
+  <div>Intro paragraph with <b>bold</b> and <i>italic</i>.</div>
+  <ul>
+  <li>bullet one</li>
+  <li>bullet two</li>
+  </ul>
+  <h2>Section</h2>
+  <ol>
+  <li>first</li>
+  <li>second</li>
+  </ol>
+  '''
+# ---
+# name: test_markdown_to_html_snapshot[21_paragraph_then_list_no_blank]
+  '''
+  <div>paragraph</div>
+  <ul>
+  <li>bullet</li>
+  <li>bullet</li>
+  </ul>
+  '''
+# ---
+# name: test_markdown_to_html_snapshot[22_empty]
+  ''
+# ---
