@@ -1,0 +1,79 @@
+# CI workflow — runs on PRs to main and pushes to main/dev.
+#
+# Mirrors obsidian-brain's ci.yml structure but adapted for Python/uv.
+# The release.yml workflow runs ITS OWN test job on tag push; this workflow
+# is the per-PR / per-push gate.
+
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main, dev]
+
+permissions: {}
+
+# One run per ref; queue rather than cancel so we don't lose intermediate
+# results on rapid push.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  validate:
+    name: Validate (test + coverage + smoke)
+    runs-on: macos-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    steps:
+      - name: Check out
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+
+      - name: Set up uv + Python 3.11
+        uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b # v8.1.0
+        with:
+          python-version: "3.11"
+          enable-cache: true
+
+      - name: Install dependencies
+        run: uv sync --extra dev
+
+      - name: Run pytest with coverage
+        run: |
+          uv run pytest -q \
+            --cov-report=term-missing \
+            --cov-report=xml \
+            --cov-report=html
+
+      - name: Run MCP smoke tests
+        run: uv run pytest -m integration -v tests/integration/test_mcp_smoke.py
+
+      - name: Verify package builds cleanly
+        run: uv build
+
+      - name: Upload coverage XML
+        if: always()
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        with:
+          name: coverage-xml
+          path: coverage.xml
+          retention-days: 14
+          if-no-files-found: warn
+
+      - name: Upload coverage HTML report
+        if: always()
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        with:
+          name: coverage-html
+          path: htmlcov/
+          retention-days: 14
+          if-no-files-found: warn
+
+      - name: Upload built distributions
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        with:
+          name: dist
+          path: dist/
+          retention-days: 7
+          if-no-files-found: error
