@@ -257,24 +257,22 @@ class TestCreateNoteBatch:
         assert len(out) == 2
         assert all(r.action == "created" for r in out)
 
-    def test_batch_empty_list_returns_empty_list(self):
-        # Bug hotspot #22: notes=[] silently returns []. Per spec this MAY
-        # warrant a ValueError ("nothing to do" is a no-op the model should
-        # know about). Locking in CURRENT behaviour; revisit when policy lands.
+    def test_batch_empty_list_raises(self):
+        # Bug hotspot #22 (FIXED): notes=[] previously returned [] silently.
+        # Now correctly raises ValueError so the caller knows nothing was done.
         patches = _common_write_patches()
         _enter_all(patches)
         try:
-            out = tools.create_note(notes=[])
+            with pytest.raises(ValueError, match="empty"):
+                tools.create_note(notes=[])
         finally:
             _stop_all(patches)
-        assert out == []
 
     def test_batch_short_count_pads_with_skipped(self):
-        # Bug hotspot #21: when AppleScript returns FEWER URIs than specs,
-        # tools.py pads with a 'skipped' MutationResult whose error mentions
-        # "(move likely failed)". The wording is wrong (should be "create"
-        # likely failed, not "move") — this test ASSERTS the typo so it
-        # surfaces as a failing test the day someone fixes it.
+        # Bug hotspot #21 (FIXED): when AppleScript returns FEWER URIs than
+        # specs, tools.py pads with a 'skipped' MutationResult whose error
+        # now correctly says "create likely failed" (was the wrong "move"
+        # wording previously).
         out_ids = "x-coredata://UUID/ICNote/p10"  # only 1 URI for 2 specs
         patches = _common_write_patches(aps_return=out_ids)
         with patch("apple_notes_brain.sqlite_reader.resolve_id", return_value=("note", 10)), \
@@ -290,8 +288,8 @@ class TestCreateNoteBatch:
         assert len(out) == 2
         assert out[0].action == "created"
         assert out[1].action == "skipped"
-        # The typo: error says "move likely failed" inside a CREATE bulk path
-        assert "move likely failed" in (out[1].error or "")
+        # Fixed wording: error now says "create likely failed" inside CREATE bulk path
+        assert "create likely failed" in (out[1].error or "")
 
     def test_batch_folder_path_resolves(self):
         out_ids = "x-coredata://UUID/ICNote/p10"
@@ -388,7 +386,8 @@ class TestUpdateNote:
         with patch("apple_notes_brain.sqlite_reader.resolve_id", return_value=("note", 100)), \
              patch("apple_notes_brain.sqlite_reader.note_meta",
                    return_value=_meta(100, locked=True)), \
-             patch("apple_notes_brain.sqlite_reader.trash_folder_pks", return_value={2}):
+             patch("apple_notes_brain.sqlite_reader.trash_folder_pks", return_value={2}), \
+             patch("apple_notes_brain.sqlite_reader.attachment_count", return_value=0):
             _enter_all(patches)
             try:
                 with pytest.raises(ValueError, match="locked"):
@@ -409,12 +408,13 @@ class TestUpdateNote:
             finally:
                 _stop_all(patches)
 
-    def test_locked_with_attachments_lock_check_first(self):
-        # Bug hotspot #12: when a note is BOTH locked and has attachments,
-        # the lock check fires first → caller sees "locked" not "attachment".
-        # This test documents CURRENT order. If the attachment guard should
-        # actually fire first (it's the more destructive risk on unlock-and-retry),
-        # this test will need flipping.
+    def test_locked_with_attachments_attachment_check_first(self):
+        # Bug hotspot #12 (FIXED): when a note is BOTH locked and has
+        # attachments, the attachment guard now fires FIRST. Reasoning:
+        # if the user sees "locked", they unlock-and-retry and silently
+        # lose attachments to Apple's `set body` bug. Showing the
+        # attachment warning first prompts them to use allow_attachment_loss
+        # explicitly.
         patches = _common_write_patches()
         with patch("apple_notes_brain.sqlite_reader.resolve_id", return_value=("note", 100)), \
              patch("apple_notes_brain.sqlite_reader.note_meta",
@@ -425,11 +425,25 @@ class TestUpdateNote:
             try:
                 with pytest.raises(ValueError) as exc_info:
                     tools.update_note(note_id="p100", body="x")
-                # CURRENT: "locked" wins over "attachment". Argument: attachment
-                # warning is more important because lock-then-unlock-and-retry
-                # would lose attachments silently.
-                assert "locked" in str(exc_info.value).lower()
-                assert "attachment" not in str(exc_info.value).lower()
+                # FIXED: attachment warning fires before lock check.
+                assert "attachment" in str(exc_info.value).lower()
+            finally:
+                _stop_all(patches)
+
+    def test_attachment_check_fires_for_locked_note(self):
+        # Regression test for the new ordering: even when a note is locked,
+        # the attachment guard MUST fire (and surface "attachment" in the
+        # error) so the user doesn't silently lose attachments on retry.
+        patches = _common_write_patches()
+        with patch("apple_notes_brain.sqlite_reader.resolve_id", return_value=("note", 100)), \
+             patch("apple_notes_brain.sqlite_reader.note_meta",
+                   return_value=_meta(100, locked=True)), \
+             patch("apple_notes_brain.sqlite_reader.trash_folder_pks", return_value={2}), \
+             patch("apple_notes_brain.sqlite_reader.attachment_count", return_value=2):
+            _enter_all(patches)
+            try:
+                with pytest.raises(ValueError, match="attachment"):
+                    tools.update_note(note_id="p100", body="x")
             finally:
                 _stop_all(patches)
 
@@ -452,7 +466,8 @@ class TestUpdateNote:
         with patch("apple_notes_brain.sqlite_reader.resolve_id", return_value=("note", 100)), \
              patch("apple_notes_brain.sqlite_reader.note_meta",
                    return_value=_meta(100, folder_pk=2)), \
-             patch("apple_notes_brain.sqlite_reader.trash_folder_pks", return_value={2}):
+             patch("apple_notes_brain.sqlite_reader.trash_folder_pks", return_value={2}), \
+             patch("apple_notes_brain.sqlite_reader.attachment_count", return_value=0):
             _enter_all(patches)
             try:
                 with pytest.raises(ValueError, match="Recently Deleted"):

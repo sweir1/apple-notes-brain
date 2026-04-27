@@ -103,8 +103,21 @@ def to_uri(z_pk: int, store_uuid: str, entity: str = "ICNote") -> str:
 # Cursor pagination helpers
 # ---------------------------------------------------------------------------
 
+# Upper bound on cursor offsets. Anyone whose Apple Notes library has a
+# billion notes has bigger problems than pagination. Rejecting offsets above
+# this cap is defence-in-depth: a malicious or malformed cursor cannot force
+# SQLite into an expensive full-index walk via a multi-billion OFFSET.
+MAX_CURSOR_OFFSET = 10**9
+
+
 def encode_cursor(offset: int) -> str:
-    """Encode an integer offset as a URL-safe base64 cursor string."""
+    """Encode an integer offset as a URL-safe base64 cursor string.
+
+    Rejects negative offsets — cursors are produced by our own pagination code
+    and a negative offset is always a programming error.
+    """
+    if offset < 0:
+        raise ValueError(f"invalid cursor: negative offset {offset}")
     return base64.urlsafe_b64encode(str(offset).encode()).decode()
 
 
@@ -112,14 +125,25 @@ def decode_cursor(cursor: str | None) -> int:
     """Decode a cursor string back to an integer offset.
 
     Returns 0 for None. Raises ValueError("invalid cursor") on bad input.
+
+    Bounds: 0 <= offset <= MAX_CURSOR_OFFSET (10^9). Out-of-bounds cursors are
+    rejected to prevent a malicious cursor from forcing SQLite into an
+    expensive full-index walk via a multi-billion OFFSET.
     """
     if cursor is None:
         return 0
     try:
         decoded = base64.urlsafe_b64decode(cursor.encode()).decode()
-        return int(decoded)
+        offset = int(decoded)
     except Exception:
         raise ValueError("invalid cursor")
+    if offset < 0:
+        raise ValueError(f"invalid cursor: negative offset {offset}")
+    if offset > MAX_CURSOR_OFFSET:
+        raise ValueError(
+            f"invalid cursor: offset {offset} exceeds maximum {MAX_CURSOR_OFFSET}"
+        )
+    return offset
 
 
 # ---------------------------------------------------------------------------

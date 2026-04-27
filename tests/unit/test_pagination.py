@@ -15,12 +15,11 @@ Bug hotspots being targeted (numbered to match the exploration notes):
   overflow in Python (arbitrary-precision ints), but the *next* request that
   uses the result still hits SQLite OFFSET. Verified to never produce a cursor
   on the final page (``has_more=False``).
-* **#5** sqlite_reader.py:782 — ``decode_cursor`` accepts arbitrarily large
-  offsets without bounds checking. Documented behaviour: the integer is
-  returned verbatim and forwarded to SQLite as ``OFFSET``.
-* **#6** sqlite_reader.py:826 — LIMIT/OFFSET passed straight to SQLite with
-  no max-offset validation. Defence-in-depth concern; cannot be exercised
-  without an in-memory DB so we document the absence of validation here.
+* **#5** sqlite_reader.py:782 — ``decode_cursor`` now enforces bounds
+  (0 <= offset <= MAX_CURSOR_OFFSET) and rejects out-of-range or negative
+  offsets with ``ValueError("invalid cursor: ...")``.
+* **#6** sqlite_reader.py:826 — LIMIT/OFFSET passed straight to SQLite. The
+  defence-in-depth gap is now closed by the bounds check in ``decode_cursor``.
 
 Most tests are direct ``encode_cursor`` / ``decode_cursor`` unit tests; only
 the ``has_more`` boundary tests mock the underlying connection.
@@ -34,6 +33,7 @@ from hypothesis import given, settings
 from hypothesis import strategies as st
 
 from apple_notes_brain.sqlite_reader import (
+    MAX_CURSOR_OFFSET,
     decode_cursor,
     encode_cursor,
 )
@@ -46,10 +46,11 @@ from apple_notes_brain.sqlite_reader import (
 
 @pytest.mark.parametrize(
     "offset",
-    [0, 1, 50, 100, 999, 1_000, 1_000_000, 2**31 - 1, 2**63 - 1],
+    [0, 1, 50, 100, 999, 1_000, 1_000_000, 10**8, MAX_CURSOR_OFFSET],
 )
 def test_cursor_roundtrip_preserves_offset(offset: int) -> None:
-    """For every plausible non-negative offset, decode(encode(o)) == o."""
+    """For every plausible non-negative offset within the cap,
+    decode(encode(o)) == o."""
     assert decode_cursor(encode_cursor(offset)) == offset
 
 
@@ -61,13 +62,19 @@ def test_cursor_roundtrip_one_million() -> None:
     assert decode_cursor(encode_cursor(1_000_000)) == 1_000_000
 
 
-def test_cursor_roundtrip_negative_offset_succeeds() -> None:
-    """Documented behaviour: the encoder doesn't reject negatives — int('-5')
-    parses fine, so the cursor round-trips. This is a *defence-in-depth* gap:
-    if a malicious client somehow crafts a negative cursor, SQLite OFFSET<0
-    is treated as 0, but list_notes never produces such a cursor itself.
-    """
-    assert decode_cursor(encode_cursor(-5)) == -5
+def test_encode_cursor_negative_offset_now_rejected() -> None:
+    """Defence-in-depth: encode_cursor refuses negative offsets up-front so
+    our own pagination code can't accidentally produce a malformed cursor."""
+    with pytest.raises(ValueError, match="negative offset"):
+        encode_cursor(-5)
+
+
+def test_decode_cursor_negative_offset_now_rejected() -> None:
+    """Even if a client crafts a base64-encoded negative integer directly
+    (bypassing encode_cursor), decode_cursor must reject it."""
+    cursor = base64.urlsafe_b64encode(b"-5").decode()
+    with pytest.raises(ValueError, match="negative offset"):
+        decode_cursor(cursor)
 
 
 def test_cursor_decode_none_returns_zero() -> None:
@@ -147,15 +154,16 @@ def test_decode_cursor_very_long_input_handled_gracefully() -> None:
     'invalid cursor'. This is good defence-in-depth: long-payload DoS
     against ``int()`` is mitigated by stdlib, not our code.
 
-    A short-but-large all-digits payload (still under the digit cap) does
-    decode successfully — verified separately to make the boundary explicit.
+    A short-but-large all-digits payload (still under the digit cap) parses
+    successfully into an int but now exceeds MAX_CURSOR_OFFSET, so
+    decode_cursor rejects it with the bounds-check message.
     """
-    # Just under the 4300-digit cap: should decode to a real (very large) int.
+    # Under the 4300-digit cap: ``int()`` succeeds, but the value is far
+    # above MAX_CURSOR_OFFSET, so decode_cursor now raises 'exceeds maximum'.
     short_digits = ("1" * 4000).encode()
     cursor = base64.urlsafe_b64encode(short_digits).decode()
-    result = decode_cursor(cursor)
-    assert isinstance(result, int)
-    assert result > 0
+    with pytest.raises(ValueError, match="exceeds maximum"):
+        decode_cursor(cursor)
 
     # 100k digits — over the int-parse cap. Must raise, not hang.
     payload = ("1" * 100_000).encode()
@@ -170,34 +178,39 @@ def test_decode_cursor_very_long_input_handled_gracefully() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Bug hotspot #5 — decode_cursor accepts huge offsets without bounds check
+# Bug hotspot #5 — decode_cursor now enforces upper bound on offsets
 # ---------------------------------------------------------------------------
 
 
-def test_bug_huge_offset_decoded_verbatim() -> None:
-    """Hotspot #5 (sqlite_reader.py:782): ``decode_cursor`` performs no
-    bounds checking on the resulting integer. A client-supplied cursor of
-    base64('100000000000') round-trips to 100_000_000_000, which is then
-    passed straight to SQLite as OFFSET (#6, line 826).
-
-    SQLite tolerates huge OFFSET values (it just walks the result set and
-    returns nothing past the end), so this isn't a crash bug — but it *is*
-    a defence-in-depth gap: there's no upper bound, and a multi-billion
-    OFFSET on a real query forces a full-table scan to return zero rows.
-
-    Pinning the current behaviour here so any future bounds check shows up
-    as a deliberate test-suite update.
+def test_huge_offset_now_rejected() -> None:
+    """Hotspot #5 (Bug #6) fix: ``decode_cursor`` now rejects offsets above
+    MAX_CURSOR_OFFSET (10^9). A client-supplied cursor of base64('100000000000')
+    used to round-trip verbatim and force SQLite into an expensive full-index
+    walk via the multi-billion OFFSET. After the fix it raises ValueError
+    before the SQL ever runs.
     """
     cursor = base64.urlsafe_b64encode(b"100000000000").decode()
-    assert decode_cursor(cursor) == 100_000_000_000
+    with pytest.raises(ValueError, match="exceeds maximum"):
+        decode_cursor(cursor)
 
 
-def test_bug_negative_offset_not_rejected() -> None:
-    """Companion to #5: negative offsets aren't rejected either. Captured
-    here so a future ``if offset < 0: raise`` change is visible in the diff.
-    """
+def test_negative_offset_now_rejected() -> None:
+    """Companion to #5: negative offsets are now rejected by decode_cursor."""
     cursor = base64.urlsafe_b64encode(b"-1").decode()
-    assert decode_cursor(cursor) == -1
+    with pytest.raises(ValueError, match="negative offset"):
+        decode_cursor(cursor)
+
+
+def test_offset_at_cap_still_works() -> None:
+    """The cap is inclusive: MAX_CURSOR_OFFSET itself round-trips fine."""
+    assert decode_cursor(encode_cursor(MAX_CURSOR_OFFSET)) == MAX_CURSOR_OFFSET
+
+
+def test_offset_one_past_cap_rejected() -> None:
+    """One past the cap raises — bounds check is strictly > MAX_CURSOR_OFFSET."""
+    cursor = base64.urlsafe_b64encode(str(MAX_CURSOR_OFFSET + 1).encode()).decode()
+    with pytest.raises(ValueError, match="exceeds maximum"):
+        decode_cursor(cursor)
 
 
 # ---------------------------------------------------------------------------
@@ -422,18 +435,17 @@ def test_bug_next_cursor_is_offset_plus_limit(patch_list_notes_internals) -> Non
 # ---------------------------------------------------------------------------
 
 
-def test_bug_no_max_offset_validation_documented() -> None:
-    """Hotspot #6 (sqlite_reader.py:826): list_notes accepts whatever offset
-    decode_cursor returns and forwards it as SQL OFFSET with no upper bound.
+def test_max_offset_validation_now_enforced() -> None:
+    """Hotspot #6 fix: decode_cursor now enforces an upper bound on offsets
+    so a malicious cursor cannot force SQLite into a full-index walk.
 
-    This isn't directly testable in isolation (the SQL goes to SQLite, which
-    happily accepts any non-negative OFFSET). What we *can* pin is that
-    ``decode_cursor`` performs no validation — i.e. there's no defence layer
-    above the SQL. Failing this test would mean a bounds check was added.
+    encode_cursor(10**18) succeeds (the producer-side check only rejects
+    negatives), but decode_cursor refuses to return that value.
     """
     huge = 10**18
     cursor = encode_cursor(huge)
-    assert decode_cursor(cursor) == huge  # no clamp, no rejection
+    with pytest.raises(ValueError, match="exceeds maximum"):
+        decode_cursor(cursor)
 
 
 # ---------------------------------------------------------------------------
@@ -456,3 +468,27 @@ def test_property_encoded_cursor_is_valid_base64(offset: int) -> None:
     """The encoded cursor must always decode under stdlib urlsafe_b64decode."""
     encoded = encode_cursor(offset)
     base64.urlsafe_b64decode(encoded.encode())  # must not raise
+
+
+@pytest.mark.property
+@given(offset=st.integers(min_value=MAX_CURSOR_OFFSET + 1, max_value=10**18))
+@settings(max_examples=100, deadline=None)
+def test_property_above_cap_offset_rejected(offset: int) -> None:
+    """For any int > MAX_CURSOR_OFFSET, decode_cursor must raise ValueError.
+
+    Build the cursor manually (bypassing encode_cursor, which only rejects
+    negatives) so we exercise decode_cursor's upper-bound check directly.
+    """
+    cursor = base64.urlsafe_b64encode(str(offset).encode()).decode()
+    with pytest.raises(ValueError, match="exceeds maximum"):
+        decode_cursor(cursor)
+
+
+@pytest.mark.property
+@given(offset=st.integers(min_value=-(10**9), max_value=-1))
+@settings(max_examples=50, deadline=None)
+def test_property_negative_offset_rejected(offset: int) -> None:
+    """For any negative int, decode_cursor must raise ValueError."""
+    cursor = base64.urlsafe_b64encode(str(offset).encode()).decode()
+    with pytest.raises(ValueError, match="negative offset"):
+        decode_cursor(cursor)

@@ -987,7 +987,7 @@ def _create_notes_bulk(
         idx = len(results)
         results.append(MutationResult(
             id="", action="skipped",
-            error=f"note {idx}: AppleScript bulk create returned no id (move likely failed)",
+            error=f"note {idx}: AppleScript bulk create returned no id (create likely failed)",
         ))
     return results
 
@@ -1010,6 +1010,11 @@ def create_note(
     Both modes go through ONE AppleScript subprocess invocation regardless of N.
     """
     if notes is not None:
+        if len(notes) == 0:
+            raise ValueError(
+                "notes list cannot be empty; pass at least one NoteCreateSpec "
+                "or use single-note mode"
+            )
         return _create_notes_bulk(notes, folder_path, format)
     if title is None:
         raise ValueError(
@@ -1036,7 +1041,31 @@ def update_note(
     meta = db.note_meta(pk)
     if not meta:
         raise ValueError(f"note not found: {note_id!r}")
-    if meta.get("locked"):
+
+    # SAFETY: AppleScript's `set body of note` silently deletes every attachment
+    # (images, sketches, scans, PDFs) on the note. Refuse unless caller explicitly
+    # acknowledges the loss. Append mode has the same underlying behaviour.
+    # Check FIRST (before lock check) so a locked-AND-attachmented note shows
+    # the more dangerous attachment warning; otherwise the user could see
+    # "locked", unlock-and-retry, and silently lose attachments.
+    if not allow_attachment_loss:
+        n_att = db.attachment_count(pk)
+        if n_att > 0:
+            raise ValueError(
+                f"refusing to update note {note_id!r}: it has {n_att} attachment(s) which "
+                "Apple's AppleScript 'body' setter would silently delete. "
+                "Pass allow_attachment_loss=True to override (only after confirming with the user)."
+            )
+
+    # Lock check AFTER attachment guard. Recoverable: user unlocks, retries.
+    locked = meta.get("locked")
+    if locked is None:
+        raise ValueError(
+            f"cannot determine lock state of note {note_id!r}; "
+            "the SQLite read may have failed or the schema is incomplete. "
+            "Refusing to update."
+        )
+    if locked:
         raise ValueError(f"refusing to write to locked note {note_id!r} — unlock in Notes.app first")
 
     # NEW: trash pre-check
@@ -1046,18 +1075,6 @@ def update_note(
             f"refusing to update note {note_id!r} — it is in Recently Deleted. "
             "Restore it first (move it to a folder)."
         )
-
-    # SAFETY: AppleScript's `set body of note` silently deletes every attachment
-    # (images, sketches, scans, PDFs) on the note. Refuse unless caller explicitly
-    # acknowledges the loss. Append mode has the same underlying behaviour.
-    if not allow_attachment_loss:
-        n_att = db.attachment_count(pk)
-        if n_att > 0:
-            raise ValueError(
-                f"refusing to update note {note_id!r}: it has {n_att} attachment(s) which "
-                "Apple's AppleScript 'body' setter would silently delete. "
-                "Pass allow_attachment_loss=True to override (only after confirming with the user)."
-            )
 
     html_body = _body_to_html(body, format)
     full_uri = db.to_uri(pk, db.store_uuid(), "ICNote")

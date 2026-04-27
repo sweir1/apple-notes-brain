@@ -593,24 +593,39 @@ def test_regex_prefilter_seed(pattern, expected):
 # get an explicit named test so a regression has somewhere obvious to land.
 # ---------------------------------------------------------------------------
 
-# Bug hotspot #11: tools.py:1040 — `meta.get("locked")` returns None on
-# older macOS where the column might not exist; check via _locked_detail.
-def test_bug_locked_note_check_handles_missing_locked_field():
-    # Bug hotspot #11: meta.get("locked") returns None when missing.
-    # `bool(None)` → False, so the locked branch is skipped silently.
-    # This documents the contract: if 'locked' is missing, we treat the
-    # note as unlocked — the user will see no "locked" error.
-    meta = {"title": "x", "folder_pk": None, "modified": 0, "pinned": 0, "shared": 0}
-    # Should not raise — just confirms the dict access is None-tolerant.
-    assert meta.get("locked") is None
-    assert bool(meta.get("locked")) is False
+# Bug hotspot #11 (FIXED): tools.py — `meta.get("locked")` returns None on
+# older macOS where the column might not exist. Previously fail-open silently;
+# now update_note explicitly raises so we never write blind.
+def test_bug_locked_field_missing_now_raises(mocker):
+    # Bug hotspot #11 (FIXED): when meta has no "locked" key, update_note
+    # used to fall through to the write path because bool(None) is False.
+    # Now it raises so we never silently overwrite a possibly-locked note.
+    from apple_notes_brain.schemas import MutationResult  # noqa: F401
+
+    meta = {
+        "id": "p100",
+        "title": "x",
+        "folder_pk": 1,
+        "modified": 0.0,
+        "pinned": False,
+        "shared": False,
+        # 'locked' intentionally absent — schema gap.
+    }
+    mocker.patch("apple_notes_brain.sqlite_reader.resolve_id", return_value=("note", 100))
+    mocker.patch("apple_notes_brain.sqlite_reader.note_meta", return_value=meta)
+    mocker.patch("apple_notes_brain.sqlite_reader.trash_folder_pks", return_value=set())
+    mocker.patch("apple_notes_brain.sqlite_reader.attachment_count", return_value=0)
+    mocker.patch("apple_notes_brain.sqlite_reader.short_id", return_value="p100")
+
+    with pytest.raises(ValueError, match="cannot determine lock state"):
+        tools.update_note(note_id="p100", body="x")
 
 
-# Bug hotspot #21: _create_notes_bulk error message says "move likely failed"
-# even though it's a CREATE operation. Verify the typo.
-def test_bug_create_notes_bulk_error_message_says_move_not_create(mocker):
-    # Bug hotspot #21: tools.py:981-992 — the padding-failure message
-    # mistakenly references "move" instead of "create".
+# Bug hotspot #21 (FIXED): _create_notes_bulk error message used to say
+# "move likely failed" inside a CREATE operation. Now correctly says "create".
+def test_bug_create_notes_bulk_error_message_says_create(mocker):
+    # Bug hotspot #21 (FIXED): tools.py — the padding-failure message
+    # now correctly references "create" instead of "move".
     from apple_notes_brain.schemas import NoteCreateSpec
 
     # Mock applescript.run to return EMPTY output — the bulk create returns
@@ -622,29 +637,24 @@ def test_bug_create_notes_bulk_error_message_says_move_not_create(mocker):
     specs = [NoteCreateSpec(title="a", body="A"), NoteCreateSpec(title="b", body="B")]
     out = tools._create_notes_bulk(specs, folder_path=None, format="markdown")
     assert len(out) == 2
-    # Both should be "skipped" with the typo message.
+    # Both should be "skipped" with the corrected message.
     assert all(r.action == "skipped" for r in out)
     err_msgs = [r.error for r in out]
-    # Bug present: the literal word "move" appears in a CREATE error.
-    assert any("move likely failed" in (m or "") for m in err_msgs), (
-        "Expected typo present (bug not yet fixed). If this assertion failed, "
-        "the message has been corrected — flip to assert 'create' instead."
-    )
+    assert any("create likely failed" in (m or "") for m in err_msgs)
+    # And the buggy "move likely failed" wording must be gone.
+    assert not any("move likely failed" in (m or "") for m in err_msgs)
 
 
-# Bug hotspot #22: create_note(notes=[]) silently returns [] — should it raise?
-def test_bug_create_note_empty_notes_list_returns_empty_silently(mocker):
-    # Bug hotspot #22: tools.py:1012-1018 — passing notes=[] returns []
-    # without ever validating that title was also provided. Documents
-    # current behaviour; a stricter implementation would raise here.
-    # Stub the inner _create_notes_bulk so we don't hit AppleScript.
+# Bug hotspot #22 (FIXED): create_note(notes=[]) used to silently return [];
+# now raises so the caller knows nothing was done.
+def test_bug_create_note_empty_notes_list_raises(mocker):
+    # Bug hotspot #22 (FIXED): tools.py — passing notes=[] previously
+    # returned [] silently. Now correctly raises ValueError.
+    # Stub the inner _create_notes_bulk so we don't hit AppleScript even
+    # though the empty check should fire before it.
     mocker.patch("apple_notes_brain.tools._create_notes_bulk", return_value=[])
-    # Safely call the underlying function without the @_with_tool_timeout decorator
-    # by reaching to its __wrapped__ attribute? The decorators use functools.wraps
-    # so calling the public symbol exercises the same code path on a non-main
-    # thread (timeout decorator falls back to direct call when SIGALRM unavailable).
-    out = tools.create_note(notes=[])
-    assert out == []  # current (buggy) behaviour — silently empty.
+    with pytest.raises(ValueError, match="empty"):
+        tools.create_note(notes=[])
 
 
 # Bug hotspot #15/#16: _wait_for_state — test the contract under simple inputs.

@@ -174,35 +174,33 @@ class TestRenameOverlay:
         # Expired -> should NOT mutate
         assert out[0]["path"] == "Old"
 
-    def test_concurrent_nested_renames_bug_hotspot_20(self, frozen_monotonic):
-        """Bug hotspot #20: rename child 'a/b' -> 'a/B', then parent 'a' -> 'X'.
+    def test_child_explicit_rename_wins_over_parent_cascade(self, frozen_monotonic):
+        """Bug hotspot #20 (FIXED): a child's explicit rename overlay must
+        take precedence over an ancestor's prefix cascade.
 
-        Pinning the ACTUAL current behaviour. Implementation has two passes:
+        Two-pass implementation:
 
-        Pass 1 — for each row, if its PK has a rename overlay, set
-                 row['path']=new_path AND record old_path+'/' -> new_path+'/'
-                 in prefix_map.
-        Pass 2 — for each row, walk prefix_map; if the (possibly already-
-                 mutated) path starts with any old_prefix, replace the prefix
-                 with the matching new_prefix and break.
+        Pass 1 — for each row, if its PK has a live rename overlay, set
+                 row['path']=new_path, record old_path+'/' -> new_path+'/'
+                 in prefix_map, AND record the row's index in
+                 `mutated_in_pass1`.
+        Pass 2 — for each row NOT in `mutated_in_pass1`, walk prefix_map;
+                 if path starts with any old_prefix, replace prefix with
+                 new_prefix and break.
 
         With rows ordered [pk=60('a'), pk=50('a/b'), pk=70('a/b/c')]:
           After pass 1: paths = ['X', 'a/B', 'a/b/c']
-                        prefix_map = {'a/': 'X/', 'a/b/': 'a/B/'}  (insertion order)
+                        prefix_map = {'a/': 'X/', 'a/b/': 'a/B/'}
+                        mutated_in_pass1 = {0, 1}
 
-          Pass 2:
-          - row[0]='X': no prefix match (no 'a/' or 'a/b/' prefix). Stays 'X'.
-          - row[1]='a/B': starts with 'a/' (first key) -> becomes 'X/B'.
-            ** Pass 2 RE-MUTATES a row that pass 1 already rewrote. **
-            This means renamed rows can be silently re-rewritten by an ancestor
-            rename — likely a real bug for callers expecting pass 1 to be
-            authoritative.
-          - row[2]='a/b/c': starts with 'a/' (first key) -> becomes 'X/b/c'.
-            The 'a/b/' prefix is never tried due to the `break`.
+          Pass 2 (skipping indices 0 and 1):
+          - row[2]='a/b/c': starts with 'a/' (first key, insertion order)
+            -> becomes 'X/b/c'. The deeper 'a/b/' prefix is never applied
+            because of `break` (first-prefix-wins, not longest).
 
-        This is the documented buggy behaviour. If implementation ever changes
-        this test will flag the change (failing loudly so the new behaviour
-        can be reviewed).
+        Previously (the bug): pass-2 re-mutated row[1] from 'a/B' to 'X/B',
+        silently overriding the child's explicit rename. After the fix,
+        row[1] stays 'a/B'.
         """
         cache.rename_path_overlay(50, "a/B")
         cache.rename_path_overlay(60, "X")
@@ -212,19 +210,68 @@ class TestRenameOverlay:
             {"id": "f70", "path": "a/b/c"},  # grandchild
         ]
         out = cache.apply_rename_overlay(rows)
-        # Parent row: 'X' (no prefix matched in pass 2).
+        # Parent row: pass-1 direct rename to 'X'; pass-2 skipped.
         assert out[0]["path"] == "X"
-        # Child row: pass 1 wrote 'a/B'; pass 2 re-rewrote via 'a/'->'X/' to 'X/B'.
-        # **This is a real bug** — child's explicit rename overlay is partly
-        # overridden by parent's prefix cascade. Pin behaviour to flag changes.
-        assert out[1]["path"] == "X/B", (
-            f"got {out[1]['path']!r}; if implementation was fixed to skip "
-            "pass-2 cascade for rows already renamed in pass 1, expected 'a/B'"
+        # Child row: pass-1 direct rename to 'a/B'; pass-2 SKIPPED so the
+        # child's explicit overlay is NOT clobbered by the parent's cascade.
+        assert out[1]["path"] == "a/B", (
+            f"got {out[1]['path']!r}; child's explicit rename overlay should "
+            "win over parent's prefix cascade"
         )
-        # Grandchild: 'a/' matches before 'a/b/' (insertion order) -> 'X/b/c'.
-        # The deeper 'a/b/' prefix is never applied because of `break`.
+        # Grandchild: not directly renamed; pass-2 applies first matching
+        # prefix in insertion order -> 'a/' -> 'X/' -> 'X/b/c'.
+        # NOTE: first-prefix-wins (not longest); see the deeper-nested
+        # regression test below for the documented limitation.
         assert out[2]["path"] == "X/b/c", (
             f"got {out[2]['path']!r}; expected first-prefix-wins result 'X/b/c'"
+        )
+
+    def test_deep_nested_renames_first_prefix_wins(self, frozen_monotonic):
+        """Regression: rename A->X, A/B->Y, A/B/C->Z. Row A/B/C/D is not
+        directly renamed; pass-2 applies the first matching prefix in
+        insertion order.
+
+        Direct renames (pass-1):
+          - row pk=10 (path 'A')      -> 'X'
+          - row pk=20 (path 'A/B')    -> 'Y'
+          - row pk=30 (path 'A/B/C')  -> 'Z'
+          prefix_map = {'A/': 'X/', 'A/B/': 'Y/', 'A/B/C/': 'Z/'}
+
+        Direct-rename rows must NOT be re-mutated by pass-2 (the fix). So:
+          - 'X' stays 'X' (and would not match any prefix anyway)
+          - 'Y' stays 'Y' (would have been clobbered to 'X/B' by pass-2 prior to fix)
+          - 'Z' stays 'Z' (would have been clobbered to 'X/B/C' by pass-2 prior to fix)
+
+        Row pk=40 (path 'A/B/C/D') is NOT directly renamed. Pass-2 walks
+        prefix_map in insertion order and breaks on the FIRST match:
+          - 'A/' matches first -> becomes 'X/B/C/D'.
+
+        KNOWN LIMITATION: the implementation picks the first matching prefix,
+        not the longest. Ideally a deeper rename ('A/B/C/' -> 'Z/') would
+        win and produce 'Z/D', but the current code stops at the first
+        match. This test pins the documented behaviour; if the
+        implementation is upgraded to longest-prefix-wins, this assertion
+        should be updated to expect 'Z/D'.
+        """
+        cache.rename_path_overlay(10, "X")
+        cache.rename_path_overlay(20, "Y")
+        cache.rename_path_overlay(30, "Z")
+        rows = [
+            {"id": "f10", "path": "A"},
+            {"id": "f20", "path": "A/B"},
+            {"id": "f30", "path": "A/B/C"},
+            {"id": "f40", "path": "A/B/C/D"},  # not directly renamed
+        ]
+        out = cache.apply_rename_overlay(rows)
+        # Direct-rename rows untouched by pass-2 cascade.
+        assert out[0]["path"] == "X"
+        assert out[1]["path"] == "Y"
+        assert out[2]["path"] == "Z"
+        # Cascade row: first-prefix-wins (insertion order).
+        assert out[3]["path"] == "X/B/C/D", (
+            f"got {out[3]['path']!r}; first-prefix-wins limitation — the "
+            "deeper 'A/B/C/' prefix would yield 'Z/D' but is never tried "
+            "due to `break` on first match"
         )
 
     def test_apply_skips_rows_with_invalid_id(self, frozen_monotonic):

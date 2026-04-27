@@ -147,11 +147,25 @@ def rename_path_overlay(folder_pk: int, new_path: str) -> None:
 
 def apply_rename_overlay(rows: list[dict]) -> list[dict]:
     """Mutate path field for rows with live overlay; cascade to descendants
-    whose old path was prefixed by the renamed parent."""
+    whose old path was prefixed by the renamed parent.
+
+    Two-pass implementation:
+      Pass 1 — Apply direct rename overlay to any row whose folder pk has a
+               live entry in `_renames`. Record indices of mutated rows so
+               pass-2 does not double-mutate them.
+      Pass 2 — For rows NOT mutated in pass 1, rewrite their path if it
+               starts with a renamed parent's old prefix.
+
+    Rationale: a child's explicit rename overlay must take precedence over
+    a grandparent's cascade. Otherwise a row whose pk had a direct rename
+    entry could get silently re-rewritten by an ancestor's prefix replacement
+    (e.g. child 'a/b' -> 'a/B' overridden by parent 'a' -> 'X' to 'X/B').
+    """
     with _tomb_lock:
         prefix_map: dict[str, str] = {}
+        mutated_in_pass1: set[int] = set()
         now = time.monotonic()
-        for row in rows:
+        for idx, row in enumerate(rows):
             try:
                 pk = int(row["id"][1:])
             except (KeyError, ValueError, TypeError):
@@ -161,10 +175,14 @@ def apply_rename_overlay(rows: list[dict]) -> list[dict]:
                 old_path = row.get("path") or ""
                 new_path = entry[1]
                 row["path"] = new_path
+                mutated_in_pass1.add(idx)
                 if old_path:
                     prefix_map[old_path + "/"] = new_path + "/"
-        # Cascade
-        for row in rows:
+        # Cascade — skip rows already directly renamed in pass 1 so the
+        # child's explicit rename wins over an ancestor's prefix cascade.
+        for idx, row in enumerate(rows):
+            if idx in mutated_in_pass1:
+                continue
             path = row.get("path") or ""
             for old_prefix, new_prefix in prefix_map.items():
                 if path.startswith(old_prefix):
