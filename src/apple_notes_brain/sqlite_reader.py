@@ -441,13 +441,18 @@ def _live_folder_subquery(conn: sqlite3.Connection) -> str:
     SQLite hasn't propagated yet. Matches Notes.app's UI semantics."""
     try:
         conn.execute("SELECT 1 FROM ACHANGE WHERE ZENTITY=15 AND ZCHANGETYPE=2 LIMIT 1")
+        # Skip ACHANGE-delete filter for folders that have a CloudKit server record
+        # (ZSERVERRECORDDATA NOT NULL) — those are confirmed-live by the cloud, so
+        # any stale delete-commit in ACHANGE is leftover migration noise. See
+        # list_folders() for the full rationale.
         return (
             "SELECT Z_PK FROM ZICCLOUDSYNCINGOBJECT outer_f "
             "WHERE outer_f.ZTITLE2 IS NOT NULL "
             "AND COALESCE(outer_f.ZMARKEDFORDELETION, 0) = 0 "
-            f"AND NOT EXISTS (SELECT 1 FROM ACHANGE a "
-            f"WHERE a.ZENTITY = {_ENT_ICFOLDER} AND a.ZCHANGETYPE = {_PHCT_DELETE} "
-            f"AND a.ZENTITYPK = outer_f.Z_PK)"
+            f"AND (outer_f.ZSERVERRECORDDATA IS NOT NULL "
+            f"     OR NOT EXISTS (SELECT 1 FROM ACHANGE a "
+            f"                    WHERE a.ZENTITY = {_ENT_ICFOLDER} AND a.ZCHANGETYPE = {_PHCT_DELETE} "
+            f"                    AND a.ZENTITYPK = outer_f.Z_PK))"
         )
     except Exception:
         return (
@@ -601,9 +606,10 @@ def child_folder_pks(parent_pk: int) -> list[int]:
         try:
             conn.execute("SELECT 1 FROM ACHANGE WHERE ZENTITY=15 AND ZCHANGETYPE=2 LIMIT 1")
             history_filter = (
-                f" AND NOT EXISTS (SELECT 1 FROM ACHANGE a "
-                f"WHERE a.ZENTITY = {_ENT_ICFOLDER} AND a.ZCHANGETYPE = {_PHCT_DELETE} "
-                f"AND a.ZENTITYPK = ZICCLOUDSYNCINGOBJECT.Z_PK)"
+                f" AND (ZICCLOUDSYNCINGOBJECT.ZSERVERRECORDDATA IS NOT NULL "
+                f"      OR NOT EXISTS (SELECT 1 FROM ACHANGE a "
+                f"                     WHERE a.ZENTITY = {_ENT_ICFOLDER} AND a.ZCHANGETYPE = {_PHCT_DELETE} "
+                f"                     AND a.ZENTITYPK = ZICCLOUDSYNCINGOBJECT.Z_PK))"
             )
         except Exception:
             history_filter = ""
@@ -682,11 +688,19 @@ def list_folders(include_counts: bool = False) -> list[dict]:
         history_filter = ""
         try:
             conn.execute("SELECT 1 FROM ACHANGE WHERE ZENTITY=15 AND ZCHANGETYPE=2 LIMIT 1")
+            # Apply ACHANGE-delete filter only to folders WITHOUT a CloudKit server
+            # record. If ZSERVERRECORDDATA is set, the folder is confirmed to exist
+            # on the CloudKit server side, so any stale delete-commit in ACHANGE is
+            # a leftover from a past migration/account-toggle, not a real deletion.
+            # Without this guard, system folders (DefaultFolder-CloudKit /
+            # TrashFolder-CloudKit) and any user folder that survived an iCloud
+            # reset get incorrectly hidden — observed on real-world databases.
             history_filter = (
-                f"AND NOT EXISTS (SELECT 1 FROM ACHANGE a "
-                f"WHERE a.ZENTITY = {_ENT_ICFOLDER} "
-                f"AND a.ZENTITYPK = f.Z_PK "
-                f"AND a.ZCHANGETYPE = {_PHCT_DELETE})"
+                f"AND (f.ZSERVERRECORDDATA IS NOT NULL "
+                f"     OR NOT EXISTS (SELECT 1 FROM ACHANGE a "
+                f"                    WHERE a.ZENTITY = {_ENT_ICFOLDER} "
+                f"                    AND a.ZENTITYPK = f.Z_PK "
+                f"                    AND a.ZCHANGETYPE = {_PHCT_DELETE}))"
             )
         except Exception:
             pass
