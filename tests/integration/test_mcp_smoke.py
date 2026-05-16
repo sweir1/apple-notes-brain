@@ -133,7 +133,8 @@ def test_server_responds_to_initialize(server_proc):
 
 @pytest.mark.timeout(PROC_TIMEOUT_S)
 def test_server_lists_all_tools(server_proc):
-    """After init, tools/list returns the 12 documented tools."""
+    """After init, tools/list returns all 16 documented tools (12 lexical
+    + 4 semantic/hybrid)."""
     # Initialize
     _send_request(
         server_proc,
@@ -159,6 +160,8 @@ def test_server_lists_all_tools(server_proc):
         "list_folders", "list_notes", "search_notes", "get_note",
         "create_note", "update_note", "rename_note", "move_note",
         "create_folder", "rename_folder", "delete_folder", "delete_note",
+        "semantic_search", "hybrid_search",
+        "reindex_semantic", "semantic_index_status",
     ])
 
 

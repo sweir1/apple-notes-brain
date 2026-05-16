@@ -7,12 +7,12 @@
     "url": "https://github.com/sweir1/apple-notes-brain",
     "source": "github"
   },
-  "version": "1.0.4",
+  "version": "1.1.0",
   "packages": [
     {
       "registryType": "pypi",
       "identifier": "apple-notes-brain",
-      "version": "1.0.4",
+      "version": "1.1.0",
       "runtimeHint": "uvx",
       "transport": {
         "type": "stdio"
@@ -42,6 +42,95 @@
           "isRequired": false,
           "format": "number",
           "default": "300"
+        },
+        {
+          "name": "APPLE_NOTES_BRAIN_DATA_DIR",
+          "description": "Directory for the semantic-index SQLite DB and embedding model cache. Defaults to $XDG_DATA_HOME/apple-notes-brain or ~/.local/share/apple-notes-brain. Used only by the semantic+hybrid search tools (v1.1); has no effect without the [semantic] install extra.",
+          "isRequired": false,
+          "format": "string"
+        },
+        {
+          "name": "APPLE_NOTES_BRAIN_MODEL_CACHE",
+          "description": "Directory for embedding model downloads. Defaults to <data_dir>/models. Maps onto huggingface_hub's cache layout so an existing HF cache can be reused.",
+          "isRequired": false,
+          "format": "string"
+        },
+        {
+          "name": "APPLE_NOTES_BRAIN_NO_WATCH",
+          "description": "Set to '1' to disable the background semantic-index watcher that polls PRAGMA data_version. Default '0' (watcher enabled when [semantic] is installed).",
+          "isRequired": false,
+          "format": "string",
+          "default": "0",
+          "choices": ["0", "1"]
+        },
+        {
+          "name": "APPLE_NOTES_BRAIN_INDEX_INTERVAL",
+          "description": "Seconds between semantic-index watcher ticks (default 30, minimum 1). Ticks are cheap when nothing changed in NoteStore.sqlite — only a single data_version probe.",
+          "isRequired": false,
+          "format": "number",
+          "default": "30"
+        },
+        {
+          "name": "APPLE_NOTES_BRAIN_MAX_CHUNK_TOKENS",
+          "description": "Override the chunker's per-chunk token budget (computed at 2.5 chars/token). Defaults to the embedder's discovered/advertised max. Lower it if the embedder OOMs on long chunks.",
+          "isRequired": false,
+          "format": "number"
+        },
+        {
+          "name": "APPLE_NOTES_BRAIN_DEBUG",
+          "description": "Set to '1' for verbose semantic-subsystem logging on stderr. Default '0'.",
+          "isRequired": false,
+          "format": "string",
+          "default": "0",
+          "choices": ["0", "1"]
+        },
+        {
+          "name": "EMBEDDING_PROVIDER",
+          "description": "Which embedder to use. 'onnx' (default, in-process ONNX with CoreML execution provider on macOS Apple Silicon) or 'ollama' (HTTP, expects an Ollama server at OLLAMA_BASE_URL).",
+          "isRequired": false,
+          "format": "string",
+          "default": "onnx",
+          "choices": ["onnx", "ollama"]
+        },
+        {
+          "name": "EMBEDDING_MODEL",
+          "description": "Short-name preset (bge-small-en-v1.5 default, bge-base-en-v1.5, all-MiniLM-L6-v2) or a literal HuggingFace repo / Ollama model identifier. Switching models forces a full re-embed on next indexing pass.",
+          "isRequired": false,
+          "format": "string",
+          "default": "bge-small-en-v1.5"
+        },
+        {
+          "name": "EMBEDDING_DIM",
+          "description": "Override the embedder's output dimensionality. Auto-probed at init; only set this for non-standard models that don't auto-probe correctly.",
+          "isRequired": false,
+          "format": "number"
+        },
+        {
+          "name": "EMBEDDING_ONNX_PROVIDERS",
+          "description": "Comma-separated list of onnxruntime execution providers to try in order. Default on macOS: 'CoreMLExecutionProvider,CPUExecutionProvider'. Default elsewhere: 'CPUExecutionProvider'. Set 'CPUExecutionProvider' alone to force CPU on Apple Silicon (e.g. if CoreML EP misbehaves for a particular model).",
+          "isRequired": false,
+          "format": "string"
+        },
+        {
+          "name": "OLLAMA_BASE_URL",
+          "description": "Base URL of the local Ollama server (only used when EMBEDDING_PROVIDER=ollama). Default http://localhost:11434. Trailing slash is stripped.",
+          "isRequired": false,
+          "format": "string",
+          "default": "http://localhost:11434"
+        },
+        {
+          "name": "OLLAMA_NUM_CTX",
+          "description": "Override the context-window probe for the Ollama embedder. When unset, /api/show is queried; if num_ctx is unavailable, falls back to 8192.",
+          "isRequired": false,
+          "format": "number"
+        },
+        {
+          "name": "APPLE_NOTES_BRAIN_OLLAMA_AUTO_PULL",
+          "description": "When EMBEDDING_PROVIDER=ollama and the configured model isn't present locally, '1' (default) auto-pulls it via /api/pull at boot; '0' refuses to start until the model exists.",
+          "isRequired": false,
+          "format": "string",
+          "default": "1",
+          "choices": ["0", "1"]
         }
       ]
     }

@@ -51,11 +51,19 @@ def test_mcp_instance_has_correct_name(server_module):
     assert server_module.mcp.name == "apple-notes-brain"
 
 
-def test_list_tools_returns_twelve_tools(server_module):
-    """All 12 documented MCP tools are registered."""
+def test_list_tools_returns_all_registered_tools(server_module):
+    """All 16 documented MCP tools are registered (12 lexical + 4 semantic).
+
+    v1.0.x had 12 tools (the lexical/CRUD set). v1.1 added four
+    embedding-backed tools that require the [semantic] install extra;
+    those return a structured `missing-extras` error when the extra
+    isn't installed but are ALWAYS registered so MCP clients can
+    discover them.
+    """
     tools = asyncio.run(server_module.mcp.list_tools())
     names = sorted(t.name for t in tools)
     expected = sorted([
+        # v1.0 lexical / CRUD surface
         "list_folders",
         "list_notes",
         "search_notes",
@@ -68,6 +76,11 @@ def test_list_tools_returns_twelve_tools(server_module):
         "rename_folder",
         "delete_folder",
         "delete_note",
+        # v1.1 semantic + hybrid additions
+        "semantic_search",
+        "hybrid_search",
+        "reindex_semantic",
+        "semantic_index_status",
     ])
     assert names == expected, f"tool list drift; got {names}"
 
