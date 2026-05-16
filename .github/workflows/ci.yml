@@ -37,7 +37,12 @@ jobs:
           enable-cache: true
 
       - name: Install dependencies
-        run: uv sync --extra dev
+        # Install BOTH extras: the dev tooling AND the semantic stack
+        # so the semantic test suite (~270 cases) can run. The
+        # missing-extras code path is still exercised by a unit test
+        # that flag-flips HAVE_SEMANTIC at runtime — no need for a
+        # separate venv-without-extras CI job for that.
+        run: uv sync --extra dev --extra semantic
 
       - name: Run pytest with coverage
         run: |
