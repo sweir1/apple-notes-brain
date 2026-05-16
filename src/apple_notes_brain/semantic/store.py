@@ -70,7 +70,15 @@ def open_db(path: Path | str) -> sqlite3.Connection:
     functions all accept a `conn` so a long-lived connection can be
     shared across calls.
     """
-    conn = sqlite3.connect(str(path), isolation_level=None, timeout=5.0)
+    # check_same_thread=False lets the background watcher thread and the
+    # MCP tool-dispatch thread share a connection. WAL mode + busy_timeout
+    # serialise writers; readers are concurrent.
+    conn = sqlite3.connect(
+        str(path),
+        isolation_level=None,
+        timeout=5.0,
+        check_same_thread=False,
+    )
     conn.execute(f"PRAGMA busy_timeout = {_BUSY_TIMEOUT_MS}")
     conn.execute("PRAGMA journal_mode = WAL")
     conn.execute("PRAGMA foreign_keys = ON")
