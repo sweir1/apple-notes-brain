@@ -543,3 +543,210 @@ def test_empty_db_trash_folder_pks_empty(empty_notestore_path):
 
 def test_empty_db_recent_notes_empty(empty_notestore_path):
     assert db.recent_notes(10) == []
+
+
+# ---------------------------------------------------------------------------
+# ZSERVERRECORDDATA guard on the ACHANGE-delete filter (issue #1, PR #2).
+#
+# Apple writes stale ZCHANGETYPE=2 rows to ACHANGE during account migrations
+# and CloudKit re-syncs WITHOUT actually deleting the folder. The pre-fix
+# filter then incorrectly hid those folders (reporter observed 956 notes in
+# the default Notes folder become invisible). The fix: skip the ACHANGE
+# filter when ZSERVERRECORDDATA IS NOT NULL, because CloudKit has confirmed
+# the folder is live on the server. True lag-window ghosts (no server
+# record yet, awaiting CloudKit ack) keep ZSERVERRECORDDATA NULL and remain
+# correctly filtered.
+#
+# These tests cover all three call sites that apply the guard:
+#   - list_folders()
+#   - child_folder_pks()
+#   - _live_folder_subquery() (via list_notes / search_notes)
+# ---------------------------------------------------------------------------
+
+# A row that simulates a stale Apple-Core-Data delete-commit for folder Z_PK = ?
+# without the row actually being marked-for-deletion on the syncing object.
+def _achange_delete_for(folder_pk: int, achange_pk: int) -> str:
+    return (
+        f"INSERT INTO ACHANGE (Z_PK, ZENTITY, ZCHANGETYPE, ZENTITYPK) "
+        f"VALUES ({achange_pk}, 15, 2, {folder_pk});"
+    )
+
+
+def test_list_folders_keeps_default_when_stale_achange_and_server_record(tmp_path, monkeypatch):
+    """Issue #1 regression: default 'Notes' folder must remain visible despite a
+    stale ACHANGE delete-commit, because ZSERVERRECORDDATA is set on it."""
+    db_path = tmp_path / "NoteStore_default_with_stale.sqlite"
+    _build_db(db_path, extra_sql=_achange_delete_for(folder_pk=2, achange_pk=900))
+    _patch_notestore(monkeypatch, db_path)
+
+    folders = db.list_folders()
+    names = sorted(f["name"] for f in folders)
+    # 'Notes' (Z_PK=2) has ZSERVERRECORDDATA NOT NULL → guard fires → visible.
+    assert "Notes" in names, f"Default folder hidden by stale ACHANGE: {names!r}"
+
+
+def test_list_folders_keeps_system_folders_when_both_have_stale_achange(tmp_path, monkeypatch):
+    """Real-world scenario from the PR: BOTH DefaultFolder-CloudKit and
+    TrashFolder-CloudKit have stale ACHANGE entries from CloudKit re-syncs.
+    Both must remain visible because both have ZSERVERRECORDDATA set."""
+    extra = (
+        _achange_delete_for(folder_pk=2, achange_pk=900)
+        + _achange_delete_for(folder_pk=3, achange_pk=901)
+    )
+    db_path = tmp_path / "NoteStore_system_folders_stale.sqlite"
+    _build_db(db_path, extra_sql=extra)
+    _patch_notestore(monkeypatch, db_path)
+
+    folders = db.list_folders()
+    names = sorted(f["name"] for f in folders)
+    assert "Notes" in names
+    assert "Recently Deleted" in names
+
+
+def test_list_folders_hides_user_folder_with_stale_achange_and_no_server_record(tmp_path, monkeypatch):
+    """Negative branch: a folder WITHOUT a CloudKit server record AND with a
+    stale ACHANGE delete-commit must remain hidden — the guard does not save
+    folders the cloud hasn't acknowledged."""
+    # Create a brand-new folder with ZSERVERRECORDDATA NULL and ZNEEDSINITIALFETCHFROMCLOUD=0
+    # (so it is NOT a ghost — the existing ghost_filter doesn't hide it).
+    extra = (
+        "INSERT INTO ZICCLOUDSYNCINGOBJECT "
+        "(Z_PK, Z_ENT, ZTITLE2, ZIDENTIFIER, ZFOLDERTYPE, ZACCOUNT8, "
+        " ZSERVERRECORDDATA, ZNEEDSINITIALFETCHFROMCLOUD) "
+        "VALUES (50, 15, 'NewLocalFolder', 'new-local-folder', 0, 1, NULL, 0);"
+        + _achange_delete_for(folder_pk=50, achange_pk=910)
+    )
+    db_path = tmp_path / "NoteStore_user_folder_no_record.sqlite"
+    _build_db(db_path, extra_sql=extra)
+    _patch_notestore(monkeypatch, db_path)
+
+    folders = db.list_folders()
+    names = sorted(f["name"] for f in folders)
+    # Without the new guard saving it, the ACHANGE filter must hide it.
+    assert "NewLocalFolder" not in names, (
+        f"Folder without server record should stay hidden when ACHANGE marks it deleted: {names!r}"
+    )
+    # Sanity: the original folders are still visible.
+    assert "Notes" in names
+    assert "Work" in names
+
+
+def test_list_folders_keeps_ghost_filter_for_folders_with_no_server_record_and_pending_fetch(
+    tmp_path, monkeypatch
+):
+    """Adjacent invariant: a true ghost (ZSERVERRECORDDATA NULL +
+    ZNEEDSINITIALFETCHFROMCLOUD=1) without any ACHANGE entry must still be
+    hidden by the existing ghost_filter — proving the new guard didn't
+    accidentally widen the gate for placeholders the cloud will never fetch."""
+    extra = (
+        "INSERT INTO ZICCLOUDSYNCINGOBJECT "
+        "(Z_PK, Z_ENT, ZTITLE2, ZIDENTIFIER, ZFOLDERTYPE, ZACCOUNT8, "
+        " ZSERVERRECORDDATA, ZNEEDSINITIALFETCHFROMCLOUD) "
+        "VALUES (51, 15, 'GhostFolder', 'ghost-folder', 0, 1, NULL, 1);"
+    )
+    db_path = tmp_path / "NoteStore_ghost.sqlite"
+    _build_db(db_path, extra_sql=extra)
+    _patch_notestore(monkeypatch, db_path)
+
+    folders = db.list_folders()
+    names = [f["name"] for f in folders]
+    assert "GhostFolder" not in names
+
+
+def test_child_folder_pks_keeps_subfolder_when_stale_achange_and_server_record(
+    tmp_path, monkeypatch
+):
+    """Subfolder under Work (PK=4) with ZSERVERRECORDDATA NOT NULL must
+    survive a stale ACHANGE delete entry."""
+    # Subfolder PK=6 already exists under Work in the base fixture, with
+    # ZSERVERRECORDDATA = X'01'. Just stamp a stale ACHANGE on it.
+    extra = _achange_delete_for(folder_pk=6, achange_pk=920)
+    db_path = tmp_path / "NoteStore_subfolder_stale.sqlite"
+    _build_db(db_path, extra_sql=extra)
+    _patch_notestore(monkeypatch, db_path)
+
+    children = db.child_folder_pks(4)
+    assert children == [6]
+
+
+def test_child_folder_pks_hides_subfolder_with_stale_achange_and_no_server_record(
+    tmp_path, monkeypatch
+):
+    """A subfolder WITHOUT a server record AND with a stale ACHANGE row
+    must be filtered out by child_folder_pks — confirms the negative
+    branch of the new guard."""
+    extra = (
+        "INSERT INTO ZICCLOUDSYNCINGOBJECT "
+        "(Z_PK, Z_ENT, ZTITLE2, ZIDENTIFIER, ZFOLDERTYPE, ZACCOUNT8, "
+        " ZSERVERRECORDDATA, ZNEEDSINITIALFETCHFROMCLOUD, ZPARENT) "
+        "VALUES (52, 15, 'LocalChild', 'local-child', 0, 1, NULL, 0, 4);"
+        + _achange_delete_for(folder_pk=52, achange_pk=921)
+    )
+    db_path = tmp_path / "NoteStore_local_child_stale.sqlite"
+    _build_db(db_path, extra_sql=extra)
+    _patch_notestore(monkeypatch, db_path)
+
+    children = db.child_folder_pks(4)
+    # Existing Subfolder (PK=6, server record set) survives.
+    assert 6 in children
+    # The local child without a server record is hidden.
+    assert 52 not in children
+
+
+def test_list_notes_keeps_notes_when_parent_has_stale_achange_and_server_record(
+    tmp_path, monkeypatch
+):
+    """End-to-end check that _live_folder_subquery (called inside list_notes)
+    also benefits from the guard. Parent folder Work (PK=4) carries a
+    stale ACHANGE delete; its note (PK=11) must still surface."""
+    extra = _achange_delete_for(folder_pk=4, achange_pk=930)
+    db_path = tmp_path / "NoteStore_work_stale.sqlite"
+    _build_db(db_path, extra_sql=extra)
+    _patch_notestore(monkeypatch, db_path)
+
+    rows, _, _, total = db.list_notes({4}, limit=100)
+    assert total == 1
+    assert rows[0]["id"] == "p11"
+
+
+def test_search_notes_keeps_results_when_parent_has_stale_achange_and_server_record(
+    tmp_path, monkeypatch
+):
+    """search_notes also relies on _live_folder_subquery; same guarantee."""
+    extra = _achange_delete_for(folder_pk=2, achange_pk=940)
+    db_path = tmp_path / "NoteStore_default_search_stale.sqlite"
+    _build_db(db_path, extra_sql=extra)
+    _patch_notestore(monkeypatch, db_path)
+
+    matches, _, _, _ = db.search_notes(
+        "Note in Notes", folder_pks=None, search_body=False, limit=100
+    )
+    titles = sorted(m[0]["title"] for m in matches)
+    assert "Note in Notes" in titles
+
+
+def test_list_notes_excludes_notes_in_parent_with_no_server_record_and_stale_achange(
+    tmp_path, monkeypatch
+):
+    """Mirror negative case for the live-folder subquery: notes in a parent
+    that genuinely fails the live-folder filter must NOT be returned."""
+    # New folder with ZSERVERRECORDDATA NULL (and NOT a ghost) + stale ACHANGE
+    # + a note inside it.
+    extra = (
+        "INSERT INTO ZICCLOUDSYNCINGOBJECT "
+        "(Z_PK, Z_ENT, ZTITLE2, ZIDENTIFIER, ZFOLDERTYPE, ZACCOUNT8, "
+        " ZSERVERRECORDDATA, ZNEEDSINITIALFETCHFROMCLOUD) "
+        "VALUES (60, 15, 'OrphanLocal', 'orphan-local', 0, 1, NULL, 0);"
+        + _achange_delete_for(folder_pk=60, achange_pk=950)
+        + "INSERT INTO ZICCLOUDSYNCINGOBJECT "
+        "(Z_PK, Z_ENT, ZTITLE1, ZIDENTIFIER, ZFOLDER, ZMODIFICATIONDATE1) "
+        "VALUES (70, 12, 'Orphan Note', 'orphan-note', 60, 7800000);"
+    )
+    db_path = tmp_path / "NoteStore_orphan_local.sqlite"
+    _build_db(db_path, extra_sql=extra)
+    _patch_notestore(monkeypatch, db_path)
+
+    rows, _, _, total = db.list_notes({60}, limit=100)
+    # Parent fails the live-folder subquery → its note is filtered out.
+    assert total == 0
+    assert rows == []
