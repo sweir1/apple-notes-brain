@@ -107,10 +107,16 @@ def test_multiple_changes_in_a_row_each_reindex():
 def test_data_version_probe_error_is_recoverable():
     """A failed data_version probe increments error count but doesn't
     kill the thread; subsequent ticks still try."""
-    seq = iter([Exception("fail"), 2, 2])
+    # Boot succeeds (dv=1), then the FIRST tick raises — this is what
+    # bumps error_count, since the boot-path failure logs a different
+    # warning and leaves _last_seen_dv=None without touching error_count.
+    seq = iter([1, Exception("fail"), 2, 2, 2, 2, 2])
 
     def dv_fn():
-        nxt = next(seq)
+        try:
+            nxt = next(seq)
+        except StopIteration:
+            return 2
         if isinstance(nxt, Exception):
             raise nxt
         return nxt
@@ -123,10 +129,16 @@ def test_data_version_probe_error_is_recoverable():
         interval_s=0.02,
     )
     w.start()
-    time.sleep(0.1)
+    # Poll instead of fixed-sleep so this isn't timing-flaky on slow runners.
+    deadline = time.monotonic() + 5.0
+    while time.monotonic() < deadline and w.error_count < 1:
+        time.sleep(0.02)
     w.request_stop()
-    w.join(timeout=1.0)
-    assert w.error_count >= 1
+    w.join(timeout=2.0)
+    assert w.error_count >= 1, (
+        f"watcher should have logged at least one error_count tick; "
+        f"tick_count={w.tick_count} error_count={w.error_count}"
+    )
 
 
 def test_index_pass_error_is_recoverable():

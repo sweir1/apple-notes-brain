@@ -30,11 +30,18 @@ jobs:
       - name: Check out
         uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
 
-      - name: Set up uv + Python 3.11
+      - name: Set up uv + Python 3.11 (managed)
         uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b # v8.1.0
         with:
           python-version: "3.11"
           enable-cache: true
+        env:
+          # Force uv to use its own Python build instead of the macOS
+          # system Python. The system /Library/Frameworks Python ships
+          # without --enable-loadable-sqlite-extensions, so
+          # sqlite_vec.load() can't be wired up. uv's managed builds
+          # support extensions.
+          UV_PYTHON_PREFERENCE: only-managed
 
       - name: Install dependencies
         # Install BOTH extras: the dev tooling AND the semantic stack
