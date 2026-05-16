@@ -15,7 +15,13 @@ class Folder(BaseModel):
 
 
 class NoteSummary(BaseModel):
-    """A condensed note row returned by list_notes and search_notes."""
+    """A condensed note row returned by list_notes / search_notes /
+    semantic_search / hybrid_search.
+
+    The five trailing fields (semantic_score, lexical_score, chunk_*)
+    are only populated by the semantic + hybrid search tools — they
+    stay `None` for the lexical path so older clients continue to
+    parse the schema unchanged."""
 
     id: str
     title: str
@@ -29,6 +35,12 @@ class NoteSummary(BaseModel):
     account: str | None = None
     attachments: int = 0
     shared: bool = False  # CloudKit shared note — owner can edit/delete; read-only participants silently fail
+
+    # Semantic / hybrid search additions (v1.1). All None for lexical paths.
+    semantic_score: float | None = None  # cosine similarity (higher better)
+    lexical_score: float | None = None   # negated BM25 (higher better)
+    chunk_excerpt: str | None = None     # ~200 chars from the matched chunk
+    chunk_heading: str | None = None     # heading of the matched chunk
 
 
 class NoteDetail(BaseModel):

@@ -20,6 +20,7 @@ from pydantic import AnyUrl
 from . import cache
 from . import sqlite_reader as db
 from . import tools
+from . import tools_semantic
 from .schemas import Folder, ListPage, MutationResult, NoteCreateSpec, NoteDetail, SearchPage
 
 log = logging.getLogger("apple-notes-brain")
@@ -126,6 +127,81 @@ def search_notes(
         modified_after=modified_after,
         modified_before=modified_before,
     )
+
+
+# ---------------------------------------------------------------------------
+# Semantic + hybrid search tools (require the [semantic] install extra).
+# Without it, each tool returns {"error": "...", "code": "missing-extras"}
+# rather than crashing the server — `search_notes` above keeps working.
+# ---------------------------------------------------------------------------
+
+@mcp.tool(annotations=READ_ONLY)
+def semantic_search(
+    query: str,
+    limit: int = 20,
+    unique: str = "notes",
+) -> SearchPage | dict:
+    """Embedding-based semantic search over chunked note bodies.
+
+    Returns the same envelope as search_notes (SearchPage). Each result
+    carries `semantic_score` (cosine similarity) and may carry
+    `chunk_excerpt` / `chunk_heading` when `unique='chunks'`.
+
+    - query: natural-language query. Empty/whitespace → empty results.
+    - limit: 1–100. Default 20.
+    - unique: 'notes' (default, dedups multi-chunk hits per note,
+       keeping the highest-scoring chunk) or 'chunks' (chunk-grained,
+       returns every match).
+
+    Requires the [semantic] install extra (ONNX runtime + tokenizers +
+    sqlite-vec). Without it, returns a `missing-extras` error envelope.
+    """
+    return tools_semantic.semantic_search(query, limit=limit, unique=unique)  # type: ignore[arg-type]
+
+
+@mcp.tool(annotations=READ_ONLY)
+def hybrid_search(
+    query: str,
+    limit: int = 20,
+    unique: str = "notes",
+) -> SearchPage | dict:
+    """Reciprocal-rank-fused semantic + lexical search. Higher recall
+    than either alone for most queries.
+
+    Same envelope as semantic_search. Each result carries both
+    `semantic_score` and `lexical_score` so the caller can render
+    provenance ("matched semantically + lexically"). RRF k=60.
+    """
+    return tools_semantic.hybrid_search(query, limit=limit, unique=unique)  # type: ignore[arg-type]
+
+
+@mcp.tool(annotations=WRITE)
+def reindex_semantic(force: bool = False) -> dict:
+    """Trigger a full pass of the semantic indexer.
+
+    Walks every note from NoteStore.sqlite, embeds chunks that changed
+    since the last pass (content-hash dedup), and removes notes no
+    longer present in the source. Returns stats:
+    `notes_seen / notes_indexed / notes_skipped / notes_deleted /
+    chunks_embedded / chunks_skipped / chunks_failed / took_ms /
+    failures`.
+
+    First call on a fresh install downloads the ONNX model
+    (~30MB) before indexing — may take a minute.
+    """
+    return tools_semantic.reindex_semantic(force=force)
+
+
+@mcp.tool(annotations=READ_ONLY)
+def semantic_index_status() -> dict:
+    """Snapshot of the semantic index + embedder configuration.
+
+    Useful for troubleshooting: shows total nodes/chunks indexed,
+    failed_chunks count, last_indexed_at, active embedder provider /
+    model / dim, ONNX execution providers in use (e.g. CoreMLExecutionProvider
+    on macOS Apple Silicon), and the data/db paths.
+    """
+    return tools_semantic.semantic_index_status()
 
 
 @mcp.tool(annotations=READ_ONLY)
