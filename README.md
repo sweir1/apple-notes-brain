@@ -53,6 +53,10 @@ returns the raw HTML (which eats tokens). This server:
 | `move_note(note_id, folder_path)` | write | Move one or many notes. `note_id` can be a string (single) or a list (batch, up to 20); `folder_path` is always a single destination. Body untouched; refuses moves into Recently Deleted. |
 | `create_folder(name, parent_folder_path?)` | write | Create a folder, optionally nested under a parent. Name cannot contain `/`. |
 | `delete_note(note_id)` | destructive | Move to Recently Deleted, or **permanently delete** if already there. Refuses locked notes. |
+| `semantic_search(query, limit?, unique?)` | read | Embedding-based chunk-level search. Same envelope as `search_notes`, plus `semantic_score` on each hit. `unique='notes'` (default) dedups multi-chunk hits per note; `unique='chunks'` returns chunk-grained hits. Requires `[semantic]` extra. |
+| `hybrid_search(query, limit?, unique?)` | read | Reciprocal-rank-fused semantic + lexical (RRF k=60). Higher recall than either alone. Each hit carries both `semantic_score` and `lexical_score`. Requires `[semantic]` extra. |
+| `reindex_semantic(force?)` | write | Trigger a full pass of the semantic indexer over NoteStore.sqlite. Content-hash dedup so re-running is cheap when nothing changed. Returns counters + a capped list of any per-chunk failures. |
+| `semantic_index_status()` | read | Snapshot: indexed nodes/chunks, failed-chunk count, last-indexed timestamp, active embedder + dim + ONNX execution providers, on-disk paths. Useful for "is the index actually built / is CoreML EP active?" sanity checks. |
 
 All write tools return `{id, action, error?}` (action ∈ `created`/`updated`/`renamed`/`moved`/`deleted`/`skipped`). All read tools return typed Pydantic models so FastMCP emits a proper `outputSchema`.
 
@@ -171,6 +175,55 @@ decrypts and never peeks:
 - `update_note` and `delete_note` on a locked note raise an error rather than
   failing mid-AppleScript.
 - Locked notes are omitted from the `notes://recent/…` autocomplete list.
+
+## Semantic + hybrid search (optional)
+
+The four tools `semantic_search`, `hybrid_search`, `reindex_semantic`,
+and `semantic_index_status` use embedding-based retrieval. They're
+gated behind the `[semantic]` install extra so the lexical CRUD tools
+stay zero-extra-dependency. Without the extra installed, those four
+tools return a structured `{"error": "...", "code": "missing-extras"}`
+envelope; the rest of the server is unaffected.
+
+```bash
+# Install with the semantic extras
+pip install 'apple-notes-brain[semantic]'
+
+# or for `uv` users
+uv add 'apple-notes-brain[semantic]'
+
+# After first call, the embedder downloads BAAI/bge-small-en-v1.5
+# (ONNX-quantised, ~30MB) into ~/.local/share/apple-notes-brain/models/
+# and runs in-process via onnxruntime. On macOS Apple Silicon, the
+# CoreMLExecutionProvider is preferred — check via semantic_index_status().
+```
+
+**Why direct ONNX (not fastembed)**: fastembed has open Apple Silicon
+performance issues ([qdrant/fastembed#535](https://github.com/qdrant/fastembed/issues/535)
+and [#97](https://github.com/qdrant/fastembed/issues/97)) — its CPU
+fallback would be a regression for the macOS-only target. We use
+`onnxruntime` + `tokenizers` + `huggingface-hub` directly so the
+CoreML execution provider lights up on M-series machines.
+
+**Why not sentence-transformers**: even with the `[onnx]` extra,
+sentence-transformers still installs PyTorch (~600MB). The
+direct-ONNX path stays at ~80MB total install.
+
+**Use Ollama instead** by setting `EMBEDDING_PROVIDER=ollama` and
+optionally `OLLAMA_BASE_URL` / `EMBEDDING_MODEL`. Models are
+auto-pulled at first call unless `APPLE_NOTES_BRAIN_OLLAMA_AUTO_PULL=0`.
+
+**Environment variables** (full list in `server.json`):
+
+| Var | Default | Notes |
+|---|---|---|
+| `APPLE_NOTES_BRAIN_DATA_DIR` | `~/.local/share/apple-notes-brain` | Where the semantic index DB + model cache live. |
+| `APPLE_NOTES_BRAIN_NO_WATCH` | `0` | `1` disables the background reindex watcher. |
+| `APPLE_NOTES_BRAIN_INDEX_INTERVAL` | `30` | Seconds between watcher ticks. Cheap when idle. |
+| `EMBEDDING_PROVIDER` | `onnx` | `onnx` or `ollama`. |
+| `EMBEDDING_MODEL` | `bge-small-en-v1.5` | Preset short-name or full HF/Ollama identifier. |
+| `EMBEDDING_ONNX_PROVIDERS` | (auto) | Override the onnxruntime EP list (e.g. `CPUExecutionProvider`). |
+| `OLLAMA_BASE_URL` | `http://localhost:11434` | When `EMBEDDING_PROVIDER=ollama`. |
 
 ## Install
 
