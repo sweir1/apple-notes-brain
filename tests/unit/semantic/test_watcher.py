@@ -83,25 +83,36 @@ def test_unchanged_data_version_skips_reindex():
 
 def test_change_triggers_reindex():
     """Boot dv=1, then dv=2 → at least one reindex."""
-    w, indexer = _build(data_versions=[1, 2, 2, 2, 2, 2], interval_s=0.02)
+    w, indexer = _build(data_versions=[1] + [2] * 50, interval_s=0.02)
     w.start()
-    time.sleep(0.15)
+    deadline = time.monotonic() + 5.0
+    while time.monotonic() < deadline and w.reindex_count < 1:
+        time.sleep(0.02)
     w.request_stop()
-    w.join(timeout=1.0)
+    w.join(timeout=2.0)
     assert w.reindex_count >= 1
     assert indexer.index_all.call_count == w.reindex_count
 
 
 def test_multiple_changes_in_a_row_each_reindex():
     """Successive distinct dv values each trigger a reindex."""
+    # Pad the sequence so iter doesn't exhaust before the deadline.
     w, indexer = _build(
-        data_versions=[1, 2, 3, 4, 5, 5, 5], interval_s=0.02
+        data_versions=[1, 2, 3, 4, 5] + [5] * 50, interval_s=0.02
     )
     w.start()
-    time.sleep(0.2)
+    # Poll-with-deadline — fixed sleeps are flaky on slow CI runners
+    # where my watcher thread can stretch 20ms intervals to 100ms+ and
+    # thus see fewer ticks per wall-second than the test assumed.
+    deadline = time.monotonic() + 8.0
+    while time.monotonic() < deadline and w.reindex_count < 3:
+        time.sleep(0.02)
     w.request_stop()
-    w.join(timeout=1.0)
-    assert w.reindex_count >= 3
+    w.join(timeout=2.0)
+    assert w.reindex_count >= 3, (
+        f"watcher should have reindexed at least 3 times for distinct dv "
+        f"values; tick_count={w.tick_count} reindex_count={w.reindex_count}"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -149,11 +160,14 @@ def test_index_pass_error_is_recoverable():
     """When IndexPipeline.index_all raises, the watcher logs and keeps
     ticking. The thread does NOT die."""
     indexer = MagicMock()
-    indexer.index_all.side_effect = [RuntimeError("oh no"), None]
-    seq = iter([1, 2, 3, 3])
+    indexer.index_all.side_effect = [RuntimeError("oh no"), None] * 50
+    seq = iter([1] + [2] * 50)
 
     def dv_fn():
-        return next(seq)
+        try:
+            return next(seq)
+        except StopIteration:
+            return 2
 
     w = SemanticWatcher(
         indexer=indexer,
@@ -162,9 +176,11 @@ def test_index_pass_error_is_recoverable():
         interval_s=0.02,
     )
     w.start()
-    time.sleep(0.15)
+    deadline = time.monotonic() + 5.0
+    while time.monotonic() < deadline and w.error_count < 1:
+        time.sleep(0.02)
     w.request_stop()
-    w.join(timeout=1.0)
+    w.join(timeout=2.0)
     # At least one error counted; thread cleanly exited.
     assert w.error_count >= 1
     assert w._thread is not None and not w._thread.is_alive()
