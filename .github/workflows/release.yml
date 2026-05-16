@@ -106,21 +106,23 @@ jobs:
     runs-on: macos-latest
     permissions:
       contents: read
+    env:
+      # Force uv-managed Python at the JOB level — every step in this job
+      # sees this var. The macos-latest system Python is built without
+      # --enable-loadable-sqlite-extensions which sqlite_vec.load() needs.
+      UV_PYTHON_PREFERENCE: only-managed
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
 
       - name: Set up uv + Python (managed)
         # SHA-pinned per setup-uv's own docs (immutable, supply-chain safe).
         # Comment denotes the human-readable version; bump both together.
+        # UV_PYTHON_PREFERENCE=only-managed is set at the job level above
+        # so it applies to every step including the actual `uv run pytest`.
         uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b # v8.1.0
         with:
           python-version: "3.11"
           enable-cache: true
-        env:
-          # Force uv to use its own Python build (system Python on macos-
-          # latest lacks loadable-sqlite-extension support which sqlite_vec
-          # needs).
-          UV_PYTHON_PREFERENCE: only-managed
 
       - name: Install dependencies
         # Both extras so the semantic test suite collects + runs.

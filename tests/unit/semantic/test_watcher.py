@@ -63,11 +63,15 @@ def test_no_watch_env_disables_start():
 def test_unchanged_data_version_skips_reindex():
     """When the data_version probe returns the same value every tick,
     the watcher does NOT call index_all (cheap-path)."""
-    w, indexer = _build(data_versions=[5] * 10, interval_s=0.02)
+    w, indexer = _build(data_versions=[5] * 50, interval_s=0.02)
     w.start()
-    time.sleep(0.1)  # ≥ 3 ticks
+    # Poll until we've observed ≥2 ticks so this isn't timing-flaky on
+    # slow CI runners.
+    deadline = time.monotonic() + 5.0
+    while time.monotonic() < deadline and w.tick_count < 2:
+        time.sleep(0.02)
     w.request_stop()
-    w.join(timeout=1.0)
+    w.join(timeout=2.0)
     assert w.tick_count >= 2
     assert w.reindex_count == 0
     assert indexer.index_all.call_count == 0
