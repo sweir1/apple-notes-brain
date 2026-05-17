@@ -338,18 +338,25 @@ def resolve_preset_config(env: Mapping[str, str]) -> ResolvedPresetConfig:
     # (1) Power-user path: EMBEDDING_MODEL set → use it raw.
     raw_model = env.get("EMBEDDING_MODEL")
     if raw_model and raw_model.strip():
-        # Honour deprecation aliases for back-compat with users who still
-        # set EMBEDDING_MODEL=bge-small-en-v1.5: route through the alias
-        # map AND surface a warning, but expand to the canonical model id
-        # so the embedder constructs against the actual HF repo.
         cleaned = raw_model.strip()
-        if cleaned in DEPRECATED_PRESET_ALIASES:
+        # Honour deprecation aliases ONLY when the user hasn't also set
+        # EMBEDDING_PROVIDER explicitly. When they have set both
+        # (e.g. EMBEDDING_MODEL=bge-small-en-v1.5 + EMBEDDING_PROVIDER=ollama),
+        # the model string is already provider-specific (in this example,
+        # `bge-small-en-v1.5` is a valid Ollama tag) — alias translation
+        # would wrongly substitute the HF onnx_repo. Trust the user's
+        # raw value when provider is pinned.
+        if cleaned in DEPRECATED_PRESET_ALIASES and explicit_provider is None:
             canonical = DEPRECATED_PRESET_ALIASES[cleaned]
             _emit_alias_warning(cleaned, canonical)
             preset = EMBEDDING_PRESETS[canonical]
+            # Pick the provider-correct identifier from the preset.
+            effective_model = (
+                preset.ollama_model if preset.provider == "ollama" else preset.onnx_repo
+            )
             return ResolvedPresetConfig(
-                provider=explicit_provider or preset.provider,
-                model=preset.model,
+                provider=preset.provider,
+                model=effective_model,
                 preset_short_name=canonical,
                 source="env-model",
             )

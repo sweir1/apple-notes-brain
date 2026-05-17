@@ -29,6 +29,11 @@ from apple_notes_brain.semantic.types import EmbedderDeadError
 def _ollama_cfg(monkeypatch, tmp_path):
     monkeypatch.setenv("APPLE_NOTES_BRAIN_DATA_DIR", str(tmp_path))
     monkeypatch.setenv("EMBEDDING_PROVIDER", "ollama")
+    # Pin the model explicitly so these tests don't depend on whatever
+    # DEFAULT_OLLAMA_MODEL happens to be (Track B aligned it with
+    # obsidian-brain's 'nomic-embed-text'; these tests want a stable
+    # 'bge-small-en-v1.5' to match their mock /api/tags response).
+    monkeypatch.setenv("EMBEDDING_MODEL", "bge-small-en-v1.5")
     return load_config()
 
 
