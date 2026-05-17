@@ -30,6 +30,7 @@ from .capacity import (
     get_capacity,
     initialise_capacity,
     reduce_discovered_max_tokens,
+    reset_discovered_capacity,
 )
 from .chunker import build_chunk_embedding_text, chunk_id, chunk_markdown
 from .source import NoteRecord, NotesSource
@@ -110,6 +111,11 @@ class IndexPipeline:
         """
         debug_log("indexer: index_all start")
         self.prepare()
+        # Reset the ratchet at the start of every full pass — see
+        # `reset_discovered_capacity` for the rationale. Matches obsidian-
+        # brain `pipeline/indexer/index.ts:97`. Per-pass ratchet then
+        # tightens again as it observes too-long chunks.
+        reset_discovered_capacity(self._conn, self._embedder)
         start_ms = int(time.time() * 1000)
         stats = IndexStats()
         seen_zids: set[str] = set()
