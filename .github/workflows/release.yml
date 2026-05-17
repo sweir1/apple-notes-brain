@@ -111,6 +111,15 @@ jobs:
       # sees this var. The macos-latest system Python is built without
       # --enable-loadable-sqlite-extensions which sqlite_vec.load() needs.
       UV_PYTHON_PREFERENCE: only-managed
+      # Pin huggingface_hub model cache to a known workspace path so the
+      # restore step below targets the same dir the prefetch step writes
+      # to and the ONNX embedder reads from. No save step in release.yml —
+      # saves live in ci.yml on main pushes only, and tag-pushed release
+      # runs read main's cache via cross-ref fallthrough (GitHub Actions
+      # caches saved on the default branch are visible to all other refs,
+      # including tags). Mirrors obsidian-brain release.yml's restore-only
+      # pattern.
+      HF_HOME: ${{ github.workspace }}/.cache/huggingface
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
 
@@ -124,9 +133,47 @@ jobs:
           python-version: "3.11"
           enable-cache: true
 
+      - name: Restore HuggingFace model cache
+        # Restore-only (no save) — saves live in ci.yml's validate job on
+        # main pushes. GitHub Actions caches are scoped per-ref: tag-pushed
+        # workflows can't share caches with each other but CAN read from
+        # the default-branch (main) scope via cross-ref fallthrough. The
+        # restore-keys ladder is intentionally redundant with ci.yml's
+        # so a release that runs before main has populated v1 still picks
+        # up an older partial-key match.
+        uses: actions/cache/restore@v5
+        continue-on-error: true
+        id: hf-cache-restore
+        with:
+          path: ${{ github.workspace }}/.cache/huggingface
+          key: hf-models-bge-small-en-v1.5-v1
+          restore-keys: |
+            hf-models-bge-small-en-v1.5-
+            hf-models-
+
       - name: Install dependencies
         # Both extras so the semantic test suite collects + runs.
         run: uv sync --extra dev --extra semantic
+
+      - name: Prefetch ONNX model (so the slow integration test is fast)
+        # Same model + filenames as ci.yml's prefetch. Cheap on a cache
+        # hit (huggingface_hub validates etag and reuses the local file);
+        # on a cold release runner (no cache hit at all, e.g. very first
+        # release after the cache scheme changed) this is the rate-limited
+        # download that the cache exists to amortise. continue-on-error
+        # left false: a release should fail visibly rather than ship a
+        # build whose integration test couldn't even fetch the model.
+        id: prefetch
+        run: |
+          uv run python -c "
+          from huggingface_hub import hf_hub_download
+          import os
+          cache = os.environ['HF_HOME']
+          for fname in ['onnx/model_quantized.onnx', 'tokenizer.json']:
+              hf_hub_download(repo_id='Xenova/bge-small-en-v1.5', filename=fname, cache_dir=cache)
+          print('prefetch ok')
+          "
+        continue-on-error: false
 
       - name: Run pytest
         run: uv run pytest -q

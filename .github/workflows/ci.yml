@@ -32,6 +32,15 @@ jobs:
       # fails on it. Force every step (setup-uv, uv sync, uv run) to use
       # uv's own managed Python which DOES support loadable extensions.
       UV_PYTHON_PREFERENCE: only-managed
+      # Pin huggingface_hub model cache to a known workspace path so
+      # actions/cache can restore + save it across runs. The ONNX embedder
+      # (`semantic/embedder/onnx.py`) and the prefetch step below both
+      # honour HF_HOME, which huggingface_hub treats as the root for its
+      # cache. Without this override, models land in the user-cache
+      # default (~/.cache/huggingface) which is harder to scope to the
+      # workspace and slower to cache. Mirrors obsidian-brain's
+      # TRANSFORMERS_CACHE pattern (TS/Node equivalent).
+      HF_HOME: ${{ github.workspace }}/.cache/huggingface
     steps:
       - name: Check out
         uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
@@ -42,6 +51,31 @@ jobs:
           python-version: "3.11"
           enable-cache: true
 
+      - name: Restore HuggingFace model cache
+        # Split restore/save so we only persist the cache AFTER prefetch
+        # verifies integrity (see the "Save" step below). Without this
+        # split, actions/cache's default post-step would save the cache
+        # directory unconditionally — including any partial downloads left
+        # behind by a killed run. That's the same defence obsidian-brain
+        # uses against the "Protobuf parsing failed" class of cache-
+        # poisoning bugs.
+        #
+        # Shared across main + dev + PRs via the restore-keys ladder:
+        # actions/cache writes are scoped per-branch, but restore-keys
+        # fall through to the default branch, so dev / PR runs read from
+        # main's cache when their own isn't populated. The save step
+        # (below) is gated to main pushes only, keeping the saved cache
+        # canonical.
+        uses: actions/cache/restore@v5
+        continue-on-error: true
+        id: hf-cache-restore
+        with:
+          path: ${{ github.workspace }}/.cache/huggingface
+          key: hf-models-bge-small-en-v1.5-v1
+          restore-keys: |
+            hf-models-bge-small-en-v1.5-
+            hf-models-
+
       - name: Install dependencies
         # Install BOTH extras: the dev tooling AND the semantic stack
         # so the semantic test suite (~270 cases) can run. The
@@ -50,12 +84,52 @@ jobs:
         # separate venv-without-extras CI job for that.
         run: uv sync --extra dev --extra semantic
 
+      - name: Prefetch ONNX model (so the slow integration test is fast)
+        # Runs BEFORE pytest so flaky HF downloads can't surface as opaque
+        # ONNX-parsing errors inside a failing test suite. Warms the cache
+        # deterministically so the end-to-end ONNX integration test
+        # (test_end_to_end_onnx.py) just reads from disk — no parallel-
+        # download races between test files. Targets the same model
+        # apple-notes-brain ships as DEFAULT_MODEL_PRESET (bge-small-en-v1.5);
+        # bump alongside the default if it ever changes.
+        id: prefetch
+        run: |
+          uv run python -c "
+          from huggingface_hub import hf_hub_download
+          import os
+          cache = os.environ['HF_HOME']
+          for fname in ['onnx/model_quantized.onnx', 'tokenizer.json']:
+              hf_hub_download(repo_id='Xenova/bge-small-en-v1.5', filename=fname, cache_dir=cache)
+          print('prefetch ok')
+          "
+        continue-on-error: false
+
       - name: Run pytest with coverage
         run: |
           uv run pytest -q \
             --cov-report=term-missing \
             --cov-report=xml \
             --cov-report=html
+
+      - name: Save HuggingFace model cache
+        # Only save when (a) prefetch succeeded AND (b) the cache was a
+        # miss on restore AND (c) we're on a main push.
+        #
+        # (a) prevents persisting a corrupt partial download under the
+        #     key — same defence as obsidian-brain.
+        # (b) skips the no-op write when an exact-key hit means nothing
+        #     changed.
+        # (c) keeps the saved cache canonical to main's state so
+        #     release.yml (which runs on tag pushes against arbitrary
+        #     refs) reliably reads main's cache via cross-ref fallthrough.
+        #     Dev / PR runs benefit from main's cache on read but don't
+        #     pollute it on write.
+        if: steps.prefetch.outcome == 'success' && steps.hf-cache-restore.outputs.cache-hit != 'true' && github.ref == 'refs/heads/main' && github.event_name == 'push'
+        uses: actions/cache/save@v5
+        continue-on-error: true
+        with:
+          path: ${{ github.workspace }}/.cache/huggingface
+          key: hf-models-bge-small-en-v1.5-v1
 
       - name: Run MCP smoke tests (subset; coverage already measured above)
         run: uv run pytest --no-cov -m integration -v tests/integration/test_mcp_smoke.py
