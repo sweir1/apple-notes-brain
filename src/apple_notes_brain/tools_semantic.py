@@ -186,11 +186,31 @@ def _missing() -> dict[str, str]:
     return dict(MISSING_EXTRAS_ERROR)
 
 
-def _to_note_summary(r) -> NoteSummary:
+def _to_note_summary(state: "SemanticState", r) -> NoteSummary:
     """Translate a ChunkAwareResult / SearchResult into the NoteSummary
-    envelope existing MCP clients already know how to render."""
+    envelope existing MCP clients already know how to render.
+
+    The semantic store keys notes by ZIDENTIFIER (a UUID), but the rest
+    of the MCP tool surface (search_notes, get_note, etc.) keys by the
+    short `pN` form. We translate here so MCP clients can round-trip
+    results between the lexical and semantic families. The original
+    ZIDENTIFIER stays on the `z_identifier` field for callers that need
+    cross-session stability.
+    """
+    from .semantic.store import get_node
+
+    z_identifier = r.note_id
+    id_str = z_identifier
+    try:
+        node = get_node(state.conn, z_identifier)
+        if node is not None:
+            id_str = f"p{node.z_pk}"
+    except Exception:
+        # If the lookup fails we fall back to the ZIDENTIFIER so the
+        # caller still gets *something* it can correlate against.
+        pass
     return NoteSummary(
-        id=r.note_id,
+        id=id_str,
         title=r.title,
         folder="",  # filled in below from the store if we have it
         modified="",
@@ -201,6 +221,7 @@ def _to_note_summary(r) -> NoteSummary:
         lexical_score=getattr(r, "lexical_score", None),
         chunk_excerpt=getattr(r, "chunk_excerpt", None),
         chunk_heading=getattr(r, "chunk_heading", None),
+        z_identifier=z_identifier,
     )
 
 
@@ -209,13 +230,17 @@ def _enrich_with_node_metadata(state: SemanticState, summaries: list[NoteSummary
 
     Both fields live in our semantic store (populated by the indexer)
     so we don't need to round-trip to NoteStore.sqlite for each hit.
+
+    Lookup keys on `z_identifier` (the UUID) when available — `id` now
+    carries the short `pN` form which the nodes table doesn't index.
     """
     if not summaries:
         return summaries
     from .semantic.store import get_node
 
     for s in summaries:
-        node = get_node(state.conn, s.id)
+        lookup_key = s.z_identifier or s.id
+        node = get_node(state.conn, lookup_key)
         if node is None:
             continue
         s.folder = node.folder or ""
@@ -226,6 +251,30 @@ def _enrich_with_node_metadata(state: SemanticState, summaries: list[NoteSummary
         s.locked = bool(node.locked)
         s.pinned = bool(node.pinned)
     return summaries
+
+
+_EMPTY_INDEX_HINT = (
+    "Semantic index is empty. Call `reindex_semantic` or wait for the "
+    "background indexer to finish — see `semantic_index_status` for progress."
+)
+
+
+def _empty_index_hint(state: SemanticState) -> str | None:
+    """Return the empty-index advisory if total_chunks == 0, else None.
+
+    Callers use this to populate `SearchPage.hint` when results are empty
+    so MCP clients can distinguish "no matches" from "index not built
+    yet" without a second tool round-trip.
+    """
+    try:
+        status = store_index_status(state.conn)
+        if status.total_chunks == 0:
+            return _EMPTY_INDEX_HINT
+    except Exception:
+        # Status lookup shouldn't ever fail, but if it does we'd rather
+        # return no hint than crash the search response.
+        return None
+    return None
 
 
 def semantic_search(
@@ -245,14 +294,16 @@ def semantic_search(
     limit = max(1, min(int(limit), 100))
     state = get_state()
     hits = state.search.semantic_chunks(query, limit=limit, unique=unique)
-    summaries = [_to_note_summary(h) for h in hits]
+    summaries = [_to_note_summary(state, h) for h in hits]
     _enrich_with_node_metadata(state, summaries)
+    hint = _empty_index_hint(state) if not summaries else None
     return SearchPage(
         results=summaries,
         returned=len(summaries),
         has_more=False,
         next_cursor=None,
         total_estimate=None,
+        hint=hint,
     )
 
 
@@ -273,14 +324,16 @@ def hybrid_search(
     limit = max(1, min(int(limit), 100))
     state = get_state()
     hits = state.search.hybrid(query, limit=limit, unique=unique)
-    summaries = [_to_note_summary(h) for h in hits]
+    summaries = [_to_note_summary(state, h) for h in hits]
     _enrich_with_node_metadata(state, summaries)
+    hint = _empty_index_hint(state) if not summaries else None
     return SearchPage(
         results=summaries,
         returned=len(summaries),
         has_more=False,
         next_cursor=None,
         total_estimate=None,
+        hint=hint,
     )
 
 

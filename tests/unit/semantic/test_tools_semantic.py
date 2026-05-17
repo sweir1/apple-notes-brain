@@ -136,8 +136,11 @@ def test_hybrid_search_returns_search_page(state):
 
 def test_hybrid_search_finds_lexical_match(state):
     out = tools_semantic.hybrid_search("yoghurt", limit=5)
-    ids = [r.id for r in out.results]
-    assert "zid-berry" in ids
+    # Phase ι: `id` is now the short `pN` form; ZIDENTIFIER lives on
+    # `z_identifier`. We match against z_identifier here so the test
+    # documents the contract the lexical match relies on.
+    zids = [r.z_identifier for r in out.results]
+    assert "zid-berry" in zids
 
 
 def test_hybrid_search_attaches_both_scores(state):
@@ -258,3 +261,186 @@ def test_note_summary_back_compat_no_semantic_fields():
     assert n.lexical_score is None
     assert n.chunk_excerpt is None
     assert n.chunk_heading is None
+    assert n.z_identifier is None
+
+
+# ---------------------------------------------------------------------------
+# Phase ι — note-id normalisation
+# ---------------------------------------------------------------------------
+
+def test_id_is_short_form_pn(state):
+    """Phase ι: `id` is now the short `p<z_pk>` form (matches the lexical
+    `search_notes` tool), not the ZIDENTIFIER UUID."""
+    out = tools_semantic.semantic_search("apple pie", limit=5)
+    assert out.results, "fixture should return at least one hit"
+    for r in out.results:
+        assert r.id.startswith("p"), f"expected pN form, got {r.id!r}"
+        # The rest is digits (an integer z_pk).
+        assert r.id[1:].isdigit(), f"expected digits after 'p', got {r.id!r}"
+
+
+def test_id_preserves_zidentifier_on_z_identifier_field(state):
+    """The original ZIDENTIFIER is still available on `z_identifier` so
+    callers can correlate across sessions / round-trip into the Notes
+    storage layer."""
+    out = tools_semantic.semantic_search("apple pie", limit=5)
+    assert out.results
+    for r in out.results:
+        assert r.z_identifier is not None
+        assert r.z_identifier.startswith("zid-")
+
+
+def test_id_falls_back_to_zidentifier_when_node_missing(state):
+    """If the nodes table doesn't have a row for the ZIDENTIFIER (race
+    between search and indexer-driven delete, or test injection), the
+    `id` field falls back to the raw ZIDENTIFIER rather than crashing."""
+
+    class FakeHit:
+        note_id = "zid-not-in-store"
+        title = "Phantom"
+        excerpt = None
+        semantic_score = 0.5
+        lexical_score = None
+        chunk_excerpt = None
+        chunk_heading = None
+
+    summary = tools_semantic._to_note_summary(state, FakeHit())
+    assert summary.id == "zid-not-in-store"
+    assert summary.z_identifier == "zid-not-in-store"
+
+
+def test_id_falls_back_to_zidentifier_when_get_node_raises(state, monkeypatch):
+    """A misbehaving store.get_node mustn't crash the response — fall back
+    to the raw ZIDENTIFIER."""
+    from apple_notes_brain.semantic import store as store_mod
+
+    def boom(*args, **kwargs):
+        raise RuntimeError("store down")
+
+    monkeypatch.setattr(store_mod, "get_node", boom)
+
+    class FakeHit:
+        note_id = "zid-apple"
+        title = "Apple"
+        excerpt = None
+        semantic_score = 0.5
+        lexical_score = None
+        chunk_excerpt = None
+        chunk_heading = None
+
+    summary = tools_semantic._to_note_summary(state, FakeHit())
+    assert summary.id == "zid-apple"
+    assert summary.z_identifier == "zid-apple"
+
+
+# ---------------------------------------------------------------------------
+# Phase ι — empty-index hint
+# ---------------------------------------------------------------------------
+
+@pytest.fixture
+def empty_state(tmp_path: Path, monkeypatch):
+    """A SemanticState with no indexed notes — so total_chunks == 0."""
+    monkeypatch.setenv("APPLE_NOTES_BRAIN_DATA_DIR", str(tmp_path))
+    cfg = load_config()
+    conn = open_db(cfg.db_path)
+    emb = FakeEmbedder(dim=64)
+    emb.init()
+    indexer = IndexPipeline(
+        conn, emb,
+        IndexerConfig(chunker_config=ChunkerConfig(
+            chunk_size=200, min_chunk_chars=10, heading_split_depth=4,
+        )),
+    )
+    indexer.prepare()  # creates schema + vec table; doesn't index any notes
+    src = FakeNotesSource()  # empty source
+    search = Search(conn, emb)
+    s = tools_semantic.SemanticState(
+        conn=conn, embedder=emb, indexer=indexer,
+        search=search, source=src, config_snapshot=cfg,
+    )
+    tools_semantic.set_state_for_tests(s)
+    yield s
+    tools_semantic.reset_state_for_tests()
+
+
+def test_semantic_search_empty_index_returns_hint(empty_state):
+    out = tools_semantic.semantic_search("anything", limit=5)
+    assert isinstance(out, SearchPage)
+    assert out.results == []
+    assert out.hint is not None
+    assert "empty" in out.hint.lower()
+    assert "reindex_semantic" in out.hint
+    assert "semantic_index_status" in out.hint
+
+
+def test_hybrid_search_empty_index_returns_hint(empty_state):
+    out = tools_semantic.hybrid_search("anything", limit=5)
+    assert isinstance(out, SearchPage)
+    assert out.results == []
+    assert out.hint is not None
+    assert "empty" in out.hint.lower()
+
+
+def test_semantic_search_empty_results_populated_index_no_hint(state):
+    """Index has rows; a query with zero matches must NOT carry the hint
+    (the hint is reserved for the empty-index case, not zero-match queries)."""
+    out = tools_semantic.semantic_search(
+        "xyzpdq-no-such-token-anywhere-1234567890", limit=5
+    )
+    # The fake embedder gives high-dim noise for any input so results
+    # are NOT necessarily empty. What we assert is the *contract*: if
+    # the index is populated the hint stays None.
+    assert out.hint is None
+
+
+def test_semantic_search_populated_index_no_hint_when_results_present(state):
+    """The hint must NOT appear when results are present."""
+    out = tools_semantic.semantic_search("apple", limit=5)
+    if out.results:
+        assert out.hint is None
+
+
+def test_empty_query_no_hint(state):
+    """Empty query short-circuits without ever touching the store —
+    no hint is set."""
+    out = tools_semantic.semantic_search("", limit=5)
+    assert out.hint is None
+    out2 = tools_semantic.hybrid_search("", limit=5)
+    assert out2.hint is None
+
+
+def test_empty_index_hint_helper_returns_none_on_status_failure(empty_state, monkeypatch):
+    """If store_index_status raises, the helper returns None rather than
+    propagating — the hint is advisory, not load-bearing."""
+    from apple_notes_brain import tools_semantic as ts_mod
+
+    def boom(*args, **kwargs):
+        raise RuntimeError("status down")
+
+    monkeypatch.setattr(ts_mod, "store_index_status", boom)
+    assert ts_mod._empty_index_hint(empty_state) is None
+
+
+def test_empty_index_hint_text_constant_format():
+    """The hint constant exists and mentions the two tools the caller
+    needs to know about."""
+    from apple_notes_brain.tools_semantic import _EMPTY_INDEX_HINT
+    assert "reindex_semantic" in _EMPTY_INDEX_HINT
+    assert "semantic_index_status" in _EMPTY_INDEX_HINT
+
+
+def test_search_page_hint_field_optional_and_defaults_none():
+    """Back-compat: SearchPage without hint still constructs."""
+    sp = SearchPage(
+        results=[], returned=0, has_more=False,
+        next_cursor=None, total_estimate=None,
+    )
+    assert sp.hint is None
+
+
+def test_search_page_hint_field_accepted():
+    sp = SearchPage(
+        results=[], returned=0, has_more=False,
+        next_cursor=None, total_estimate=None, hint="custom advisory",
+    )
+    assert sp.hint == "custom advisory"
