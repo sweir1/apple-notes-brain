@@ -34,6 +34,8 @@ from pathlib import Path
 import numpy as np
 import sqlite_vec
 
+from ._logging import debug_log
+
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -181,6 +183,7 @@ def _init_schema(conn: sqlite3.Connection) -> None:
         "VALUES ('schema_version', ?, ?)",
         (str(SCHEMA_VERSION), int(time.time())),
     )
+    debug_log(f"store: schema initialised at version={SCHEMA_VERSION}")
 
 
 def current_schema_version(conn: sqlite3.Connection) -> int:
@@ -221,9 +224,17 @@ def ensure_vec_tables(conn: sqlite3.Connection, dim: int) -> None:
     # Mismatch — check row count.
     count = conn.execute("SELECT COUNT(*) FROM chunks_vec").fetchone()[0]
     if count == 0:
+        debug_log(
+            f"store: vec dim mismatch stored={stored} embedder={dim} "
+            f"empty=True → recreating"
+        )
         conn.execute("DROP TABLE chunks_vec")
         _create_chunks_vec(conn, dim)
         return
+    debug_log(
+        f"store: vec dim mismatch stored={stored} embedder={dim} "
+        f"populated={count} → raising"
+    )
     raise DimensionMismatchError(
         f"chunks_vec was built for dim={stored} but the current embedder "
         f"emits dim={dim}. The table has {count} rows — refusing to drop. "
@@ -237,6 +248,7 @@ def _create_chunks_vec(conn: sqlite3.Connection, dim: int) -> None:
         f"embedding float[{int(dim)}])"
     )
     _set_metadata(conn, "chunks_vec_dim", str(int(dim)))
+    debug_log(f"store: chunks_vec created at dim={int(dim)}")
 
 
 def _set_metadata(conn: sqlite3.Connection, key: str, value: str) -> None:

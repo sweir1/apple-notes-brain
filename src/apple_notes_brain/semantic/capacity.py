@@ -18,8 +18,18 @@ from __future__ import annotations
 import sqlite3
 import time
 from dataclasses import dataclass
+from typing import Literal
 
 from .types import Embedder
+
+
+# How `get_capacity` learned the effective value — kept on the capability
+# row + surfaced on the snapshot so a debug session can see whether a
+# given chunk size came from the tokenizer config, an API probe, the
+# ratchet, a manual override, or the safe-default fallback.
+CapacityMethod = Literal[
+    "tokenizer_config", "api_show", "probe", "ratchet", "manual", "fallback"
+]
 
 # Cross-model average — BGE/MiniLM/E5 all sit around 2.5 chars/token in
 # English text. Multilingual models drop to ~1.5; future tuning per
@@ -43,6 +53,11 @@ class EmbedderCapacity:
     discovered_max_tokens: int | None
     effective_max_tokens: int
     chunk_budget_chars: int
+    # Where the effective value came from. Defaults to 'fallback' for
+    # ambient `get_capacity` calls that hit no capability row at all;
+    # populated with the actual source when at least one column was
+    # set (see `_classify_method`).
+    method: CapacityMethod = "fallback"
 
 
 def _embedder_id(embedder: Embedder) -> str:
@@ -55,24 +70,66 @@ def get_capacity(conn: sqlite3.Connection, embedder: Embedder) -> EmbedderCapaci
 
     `effective_max_tokens` = min(advertised, discovered) if both present,
     else whichever is present, else FALLBACK_MAX_TOKENS.
+
+    `method` describes which source contributed the effective value:
+      * 'ratchet'  — discovered (a ratchet wrote it) is the active value
+      * 'manual'   — explicit `method` column was set to 'manual'
+      * other 'method' column value (e.g. 'tokenizer_config', 'api_show',
+        'probe') propagates through when only the advertised path applies
+      * 'fallback' — no row at all, defaults applied
     """
     embedder_id = _embedder_id(embedder)
     row = conn.execute(
-        "SELECT advertised_max_tokens, discovered_max_tokens "
+        "SELECT advertised_max_tokens, discovered_max_tokens, method "
         "FROM embedder_capability WHERE embedder_id = ? "
         "ORDER BY fetched_at DESC LIMIT 1",
         (embedder_id,),
     ).fetchone()
     advertised = int(row[0]) if row and row[0] is not None else None
     discovered = int(row[1]) if row and row[1] is not None else None
+    stored_method = row[2] if row and len(row) > 2 else None
     effective = _effective_max_tokens(advertised, discovered)
+    method = _classify_method(advertised, discovered, stored_method)
     return EmbedderCapacity(
         embedder_id=embedder_id,
         advertised_max_tokens=advertised,
         discovered_max_tokens=discovered,
         effective_max_tokens=effective,
         chunk_budget_chars=int(effective * CHARS_PER_TOKEN),
+        method=method,
     )
+
+
+def _classify_method(
+    advertised: int | None,
+    discovered: int | None,
+    stored_method: str | None,
+) -> CapacityMethod:
+    """Translate the (advertised, discovered, stored_method) triple into
+    the user-facing `method` label.
+
+    Rules (mirrors obsidian-brain `capacity.ts:getCapacity` source field):
+    - No row at all → 'fallback'
+    - Discovered is binding (effective came from it) → preserve stored
+      method when it's a known label, otherwise 'ratchet'
+    - Only advertised → preserve stored method when it's a known label,
+      otherwise the safe 'probe' (the most-common reason a row was
+      written without a ratchet kicking in)
+    """
+    if advertised is None and discovered is None:
+        return "fallback"
+    # Discovered binds when it's the lower of the two (or the only one).
+    discovered_binds = discovered is not None and (
+        advertised is None or discovered <= advertised
+    )
+    valid_methods: tuple[CapacityMethod, ...] = (
+        "tokenizer_config", "api_show", "probe", "ratchet", "manual", "fallback",
+    )
+    if isinstance(stored_method, str) and stored_method in valid_methods:
+        return stored_method  # type: ignore[return-value]
+    if discovered_binds:
+        return "ratchet"
+    return "probe"
 
 
 def _effective_max_tokens(
@@ -143,6 +200,38 @@ def reduce_discovered_max_tokens(
         ),
     )
     return target
+
+
+def reset_discovered_capacity(
+    conn: sqlite3.Connection, embedder: Embedder
+) -> None:
+    """Reset the discovered ratchet for this embedder back to the
+    advertised value.
+
+    Called at the start of every full `index_all` pass: a fresh full
+    pass is the only safe time to widen capacity back to the embedder's
+    advertised ceiling, because the per-pass ratchet WILL drag it back
+    down again the first time a too-long chunk is observed. Without this
+    reset a single transient outlier from months ago could permanently
+    cap every future chunk at a tiny size.
+
+    Mirrors obsidian-brain `src/embeddings/capacity.ts:reset
+    DiscoveredCapacity`.
+
+    Idempotent — repeated calls are no-ops once the row already has
+    discovered = advertised (or both columns NULL).
+    """
+    embedder_id = _embedder_id(embedder)
+    conn.execute(
+        """
+        UPDATE embedder_capability
+           SET discovered_max_tokens = advertised_max_tokens,
+               discovered_at         = ?,
+               method                = COALESCE(method, 'fallback')
+         WHERE embedder_id = ?
+        """,
+        (int(time.time()), embedder_id),
+    )
 
 
 def approx_tokens_for(text: str) -> int:

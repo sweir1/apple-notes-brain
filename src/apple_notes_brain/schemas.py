@@ -41,6 +41,11 @@ class NoteSummary(BaseModel):
     lexical_score: float | None = None   # negated BM25 (higher better)
     chunk_excerpt: str | None = None     # ~200 chars from the matched chunk
     chunk_heading: str | None = None     # heading of the matched chunk
+    # ZIDENTIFIER UUID of the underlying note. Stable across sessions and
+    # safe to round-trip through the Apple Notes APIs even when local pK
+    # values shift on rebuild. `id` (above) carries the short `pN` form
+    # for consistency with lexical search_notes.
+    z_identifier: str | None = None
 
 
 class NoteDetail(BaseModel):
@@ -67,6 +72,10 @@ class SearchPage(BaseModel):
     has_more: bool
     next_cursor: str | None
     total_estimate: int | None
+    # Optional advisory message — populated by semantic_search / hybrid_search
+    # when an empty result list could surprise the caller (e.g. the index
+    # hasn't been built yet). Always None for lexical search_notes.
+    hint: str | None = None
 
 
 class ListPage(BaseModel):

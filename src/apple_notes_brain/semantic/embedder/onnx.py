@@ -25,6 +25,7 @@ from typing import Any, Literal
 
 import numpy as np
 
+from .._logging import debug_log
 from ..config import SemanticConfig
 from ..types import (
     EmbedderDeadError,
@@ -89,12 +90,22 @@ class OnnxEmbedder:
             self._tokenizer = self._build_tokenizer(tokenizer_path)
             self._session = self._build_session(model_path)
             self._dim = self._probe_dim()
+            try:
+                active = list(self._session.get_providers())
+            except Exception:
+                active = []
+            _log.info(
+                "onnx embedder ready: dim=%d providers=%s",
+                self._dim,
+                active,
+            )
         except (ModelLoadError, ModelDownloadError) as exc:
             if not retry:
                 raise
             if isinstance(exc, ModelDownloadError):
                 # Download errors aren't fixable by a cache wipe — re-raise.
                 raise
+            debug_log(f"onnx: load failed, clearing cache and retrying — {exc}")
             _log.warning(
                 "apple-notes-brain: ONNX model load failed (%s); clearing "
                 "the model cache for %s and retrying once.",
@@ -119,6 +130,10 @@ class OnnxEmbedder:
 
     def _download(self, filename: str) -> Path:
         """Wrap huggingface_hub.hf_hub_download with our error type."""
+        debug_log(
+            f"onnx: downloading {filename} from {self._repo_id} "
+            f"→ {self._cfg.model_cache}"
+        )
         try:
             from huggingface_hub import hf_hub_download
         except ImportError as exc:
@@ -152,6 +167,7 @@ class OnnxEmbedder:
             raise ModelLoadError(
                 f"Failed to load tokenizer from {tokenizer_path}: {exc}"
             ) from exc
+        debug_log("onnx: tokenizer loaded")
         # Enable truncation at the model's max-length so >512-token inputs
         # don't crash session.run with shape mismatches.
         tok.enable_truncation(max_length=self._max_tokens)
@@ -164,6 +180,7 @@ class OnnxEmbedder:
             raise ImportError(
                 "onnxruntime is required for the ONNX embedder."
             ) from exc
+        debug_log(f"onnx: building session with providers={list(self._providers)}")
         try:
             session = ort.InferenceSession(str(model_path), providers=list(self._providers))
         except Exception as exc:

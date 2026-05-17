@@ -14,6 +14,7 @@ from apple_notes_brain.semantic.capacity import (
     get_capacity,
     initialise_capacity,
     reduce_discovered_max_tokens,
+    reset_discovered_capacity,
 )
 from apple_notes_brain.semantic.store import open_db
 from .conftest import FakeEmbedder
@@ -180,3 +181,155 @@ def test_distinct_embedders_have_independent_capacity(conn):
     cap2 = get_capacity(conn, e2)
     assert cap1.advertised_max_tokens == 512
     assert cap2.advertised_max_tokens == 8192
+
+
+# ---------------------------------------------------------------------------
+# Phase θ — reset_discovered_capacity
+# ---------------------------------------------------------------------------
+
+def test_reset_restores_discovered_to_advertised(conn, emb):
+    """After a ratchet shrinks discovered, reset_discovered_capacity
+    restores it to the advertised ceiling so the next full indexing
+    pass starts from the embedder's actual stated capacity."""
+    initialise_capacity(conn, emb, advertised_max_tokens=512)
+    reduce_discovered_max_tokens(conn, emb, observed_tokens=600)
+    cap_before = get_capacity(conn, emb)
+    assert cap_before.discovered_max_tokens == 540
+
+    reset_discovered_capacity(conn, emb)
+
+    cap_after = get_capacity(conn, emb)
+    assert cap_after.discovered_max_tokens == 512
+    assert cap_after.effective_max_tokens == 512
+
+
+def test_reset_is_noop_when_no_row(conn, emb):
+    """No capability row at all → reset is a silent no-op (no insert)."""
+    reset_discovered_capacity(conn, emb)
+    cnt = conn.execute(
+        "SELECT COUNT(*) FROM embedder_capability WHERE embedder_id = ?",
+        (emb.model_identifier(),),
+    ).fetchone()[0]
+    assert cnt == 0
+
+
+def test_reset_is_idempotent(conn, emb):
+    """Calling reset repeatedly doesn't drift."""
+    initialise_capacity(conn, emb, advertised_max_tokens=512)
+    reduce_discovered_max_tokens(conn, emb, observed_tokens=600)
+    reset_discovered_capacity(conn, emb)
+    reset_discovered_capacity(conn, emb)
+    reset_discovered_capacity(conn, emb)
+    cap = get_capacity(conn, emb)
+    assert cap.discovered_max_tokens == 512
+
+
+def test_reset_does_not_widen_when_advertised_is_null(conn, emb):
+    """If advertised is NULL, reset can't manufacture a value from thin
+    air — discovered stays NULL too."""
+    # Insert a row with only discovered set.
+    reduce_discovered_max_tokens(conn, emb, observed_tokens=400)
+    reset_discovered_capacity(conn, emb)
+    row = conn.execute(
+        "SELECT advertised_max_tokens, discovered_max_tokens "
+        "FROM embedder_capability WHERE embedder_id = ?",
+        (emb.model_identifier(),),
+    ).fetchone()
+    assert row[0] is None
+    assert row[1] is None  # reset to NULL since advertised is NULL
+
+
+def test_reset_independent_per_embedder(conn):
+    """Resetting one embedder doesn't affect the other's discovered value."""
+    e1 = FakeEmbedder(model_id="m1")
+    e2 = FakeEmbedder(model_id="m2")
+    initialise_capacity(conn, e1, advertised_max_tokens=512)
+    initialise_capacity(conn, e2, advertised_max_tokens=512)
+    reduce_discovered_max_tokens(conn, e1, observed_tokens=600)
+    reduce_discovered_max_tokens(conn, e2, observed_tokens=600)
+    reset_discovered_capacity(conn, e1)
+    cap1 = get_capacity(conn, e1)
+    cap2 = get_capacity(conn, e2)
+    assert cap1.discovered_max_tokens == 512  # reset
+    assert cap2.discovered_max_tokens == 540  # untouched
+
+
+# ---------------------------------------------------------------------------
+# Phase θ — method tracking on EmbedderCapacity
+# ---------------------------------------------------------------------------
+
+def test_method_defaults_to_fallback_when_no_row(conn, emb):
+    cap = get_capacity(conn, emb)
+    assert cap.method == "fallback"
+
+
+def test_method_is_ratchet_after_reduce(conn, emb):
+    initialise_capacity(conn, emb, advertised_max_tokens=1024)
+    reduce_discovered_max_tokens(conn, emb, observed_tokens=600)
+    cap = get_capacity(conn, emb)
+    assert cap.method == "ratchet"
+
+
+def test_method_field_present_on_dataclass():
+    """The EmbedderCapacity dataclass exposes a `method` attribute with
+    the documented Literal type — protects against accidental field
+    removal."""
+    cap = EmbedderCapacity(
+        embedder_id="m", advertised_max_tokens=512,
+        discovered_max_tokens=None, effective_max_tokens=512,
+        chunk_budget_chars=1280,
+    )
+    # Default value applies.
+    assert cap.method == "fallback"
+
+
+def test_method_preserved_when_only_advertised_set(conn, emb):
+    """After initialise_capacity (no ratchet), method classification
+    falls through to 'probe' — there's no stored method label yet,
+    discovered isn't binding, so we report the most-likely source."""
+    initialise_capacity(conn, emb, advertised_max_tokens=512)
+    cap = get_capacity(conn, emb)
+    assert cap.method == "probe"
+
+
+def test_method_after_reset_still_present(conn, emb):
+    """After reset, the stored method column is COALESCE'd to 'fallback'
+    if it was NULL. Either way it should be a valid label."""
+    initialise_capacity(conn, emb, advertised_max_tokens=512)
+    reduce_discovered_max_tokens(conn, emb, observed_tokens=600)
+    reset_discovered_capacity(conn, emb)
+    cap = get_capacity(conn, emb)
+    # Method column still says 'ratchet' since reduce wrote it; reset
+    # only COALESCE'd when null. That's fine — we surface the value.
+    assert cap.method in ("ratchet", "fallback", "probe", "manual",
+                          "tokenizer_config", "api_show")
+
+
+# ---------------------------------------------------------------------------
+# Phase θ — indexer.index_all calls reset_discovered_capacity at start
+# ---------------------------------------------------------------------------
+
+def test_index_all_resets_discovered_capacity_at_start(conn, emb, tmp_path: Path):
+    """A full pass widens discovered back to advertised before iterating,
+    so a single transient outlier doesn't permanently shrink chunks."""
+    from apple_notes_brain.semantic.indexer import IndexPipeline, IndexerConfig
+    from apple_notes_brain.semantic.source import FakeNotesSource, NoteRecord
+
+    # Seed: an embedder with advertised=512 and a ratcheted discovered=540.
+    initialise_capacity(conn, emb, advertised_max_tokens=512)
+    reduce_discovered_max_tokens(conn, emb, observed_tokens=600)
+    pre = get_capacity(conn, emb)
+    assert pre.discovered_max_tokens == 540
+
+    pipe = IndexPipeline(conn, emb, IndexerConfig(advertised_max_tokens=512))
+    src = FakeNotesSource()
+    rec = NoteRecord(
+        z_identifier="zid-1", z_pk=1, title="t",
+        folder=None, modified_at=1, locked=False, pinned=False,
+    )
+    src.add(rec, "body text")
+    pipe.index_all(src)
+
+    post = get_capacity(conn, emb)
+    # Reset widened discovered back to advertised at the start of the pass.
+    assert post.discovered_max_tokens == 512
