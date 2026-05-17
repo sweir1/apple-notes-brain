@@ -24,6 +24,7 @@ import sqlite3
 import time
 from dataclasses import dataclass
 
+from ._logging import debug_log
 from .capacity import (
     approx_tokens_for,
     get_capacity,
@@ -107,6 +108,7 @@ class IndexPipeline:
         Notes present in the index but absent from the source are
         deleted (cascade removes chunks + vec rows).
         """
+        debug_log("indexer: index_all start")
         self.prepare()
         start_ms = int(time.time() * 1000)
         stats = IndexStats()
@@ -139,6 +141,12 @@ class IndexPipeline:
             stats.chunks_failed += outcome["chunks_failed"]
             if outcome["failures"]:
                 stats.failures.extend(outcome["failures"])
+            debug_log(
+                f"indexer: {record.z_identifier!r} ({stats.notes_seen}) → "
+                f"embed={outcome['chunks_embedded']} "
+                f"skip={outcome['chunks_skipped']} "
+                f"fail={outcome['chunks_failed']}"
+            )
 
         # Tombstone sweep: notes in the index that aren't in the source.
         from .store import all_node_ids
@@ -150,6 +158,12 @@ class IndexPipeline:
             stats.notes_deleted += 1
 
         stats.took_ms = int(time.time() * 1000) - start_ms
+        _log.info(
+            "indexer: pass complete: %d indexed, %d embedded, %dms",
+            stats.notes_indexed,
+            stats.chunks_embedded,
+            stats.took_ms,
+        )
         return stats
 
     def index_single(

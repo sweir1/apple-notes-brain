@@ -34,6 +34,7 @@ _log = logging.getLogger("apple-notes-brain")
 # ---------------------------------------------------------------------------
 
 try:
+    from .semantic._logging import debug_log, setup_logging
     from .semantic.config import load_config
     from .semantic.embedder import create_embedder
     from .semantic.indexer import IndexPipeline, IndexerConfig
@@ -122,10 +123,20 @@ def get_state() -> SemanticState:
             "get_state() called without [semantic] extras installed. "
             "Tool callers must guard on HAVE_SEMANTIC."
         )
+    # Wire debug logging FIRST so subsequent steps can emit DEBUG-level
+    # lines. Idempotent — safe to call from every entry point.
+    setup_logging()
+    debug_log("semantic: initialising state singleton")
     cfg = load_config()
     conn = open_db(cfg.db_path)
     embedder = create_embedder(cfg)
     embedder.init()
+    _log.info(
+        "semantic: embedder ready: provider=%s model=%s dim=%d",
+        embedder.provider_name(),
+        embedder.model_identifier(),
+        embedder.dimensions(),
+    )
     indexer = IndexPipeline(
         conn=conn,
         embedder=embedder,
@@ -149,6 +160,7 @@ def get_state() -> SemanticState:
         source=source,
         config_snapshot=cfg,
     )
+    _log.info("semantic: state singleton ready")
     return _state
 
 
