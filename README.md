@@ -220,10 +220,24 @@ auto-pulled at first call unless `APPLE_NOTES_BRAIN_OLLAMA_AUTO_PULL=0`.
 | `APPLE_NOTES_BRAIN_DATA_DIR` | `~/.local/share/apple-notes-brain` | Where the semantic index DB + model cache live. |
 | `APPLE_NOTES_BRAIN_NO_WATCH` | `0` | `1` disables the background reindex watcher. |
 | `APPLE_NOTES_BRAIN_INDEX_INTERVAL` | `30` | Seconds between watcher ticks. Cheap when idle. |
-| `EMBEDDING_PROVIDER` | `onnx` | `onnx` or `ollama`. |
-| `EMBEDDING_MODEL` | `bge-small-en-v1.5` | Preset short-name or full HF/Ollama identifier. |
+| `EMBEDDING_PROVIDER` | `onnx` | `onnx` or `ollama`. When in conflict with a preset, provider wins (warning emitted). |
+| `EMBEDDING_PRESET` | `english` | Named preset — see table below. Sets `(provider, model)` atomically. |
+| `EMBEDDING_MODEL` | _(unset)_ | Literal HF repo or Ollama tag. Overrides `EMBEDDING_PRESET` when both set. |
 | `EMBEDDING_ONNX_PROVIDERS` | (auto) | Override the onnxruntime EP list (e.g. `CPUExecutionProvider`). |
 | `OLLAMA_BASE_URL` | `http://localhost:11434` | When `EMBEDDING_PROVIDER=ollama`. |
+
+**Named presets** (mirror obsidian-brain — same names, same models):
+
+| Preset | Provider | Model | Dim | Notes |
+|---|---|---|---|---|
+| `english` (default) | onnx | `Xenova/bge-small-en-v1.5` | 384 | Fast English-only; ~30 MB; asymmetric (query prefix). |
+| `english-fast` | onnx | `MongoDB/mdbr-leaf-ir` | 384 | Fastest English; Apache-2.0; asymmetric. |
+| `english-quality` | onnx | `Xenova/bge-base-en-v1.5` | 768 | Higher-quality English; ~100 MB. |
+| `multilingual` | onnx | `Xenova/multilingual-e5-small` | 384 | Multilingual; `query:` / `passage:` prefixes. |
+| `multilingual-quality` | onnx | `Xenova/multilingual-e5-base` | 768 | Higher-quality multilingual; known long-input token_type_ids quirk in transformers.js. |
+| `multilingual-ollama` | ollama | `qwen3-embedding:0.6b` | 1024 | Lossless multilingual via Ollama (32k ctx). Requires local Ollama server. |
+
+Legacy short-names (`bge-small-en-v1.5`, `bge-base-en-v1.5`, `all-MiniLM-L6-v2`) still resolve to their canonical preset with a one-shot deprecation warning. Switching presets / models forces a full re-embed on the next indexing pass.
 
 ## Install
 

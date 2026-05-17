@@ -112,10 +112,19 @@ build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/apple_notes_brain"]
+# Hatchling already includes package-internal data files when they live
+# inside the package, but we list it here explicitly belt-and-braces:
+# `data/seed-models.json` is load-bearing for the metadata resolver
+# chain (Phase γ). If it's missing from the wheel, the resolver silently
+# falls back to the live HF fetcher (slow + offline-broken).
+include = [
+    "src/apple_notes_brain/data/*.json",
+]
 
 [tool.hatch.build.targets.sdist]
 include = [
     "src/apple_notes_brain",
+    "src/apple_notes_brain/data/*.json",
     "README.md",
     "LICENSE",
     "pyproject.toml",

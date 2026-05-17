@@ -26,6 +26,7 @@ from apple_notes_brain.semantic.config import (
     ENV_OLLAMA_BASE_URL,
     ENV_OLLAMA_NUM_CTX,
     ENV_ONNX_PROVIDERS,
+    ENV_PRESET,
     ENV_PROVIDER,
     SemanticConfig,
     _bool_env,
@@ -36,6 +37,22 @@ from apple_notes_brain.semantic.config import (
     resolve_db_path,
     resolve_model_cache,
 )
+from apple_notes_brain.semantic.embedder.presets import (
+    EMBEDDING_PRESETS,
+    _reset_warning_state,
+)
+
+
+# ---------------------------------------------------------------------------
+# Reset the preset module's one-shot warning trackers between tests so
+# deprecation-alias coverage doesn't get suppressed by test ordering.
+# ---------------------------------------------------------------------------
+
+@pytest.fixture(autouse=True)
+def _reset_preset_warnings():
+    _reset_warning_state()
+    yield
+    _reset_warning_state()
 
 
 # ---------------------------------------------------------------------------
@@ -191,7 +208,10 @@ def test_load_config_all_defaults(monkeypatch, tmp_path):
     cfg = load_config()
     assert isinstance(cfg, SemanticConfig)
     assert cfg.provider == DEFAULT_PROVIDER == "onnx"
-    assert cfg.model == DEFAULT_MODEL_PRESET == "bge-small-en-v1.5"
+    # Post-uplift: load_config routes through resolve_preset_config which
+    # expands the default preset (`english`) to its concrete HF id.
+    assert cfg.model == DEFAULT_MODEL_PRESET == "Xenova/bge-small-en-v1.5"
+    assert cfg.preset_short_name == "english"
     assert cfg.dim_override is None
     assert cfg.no_watch is False
     assert cfg.index_interval_s == DEFAULT_INDEX_INTERVAL_SECONDS
@@ -283,11 +303,85 @@ def test_load_config_ollama_num_ctx_override(monkeypatch, tmp_path):
     assert cfg.ollama_num_ctx_override == 4096
 
 
-def test_load_config_model_override(monkeypatch, tmp_path):
+def test_load_config_model_override_raw(monkeypatch, tmp_path):
+    """Power-user path: EMBEDDING_MODEL=<raw HF repo> is taken verbatim."""
+    monkeypatch.setenv(ENV_DATA_DIR, str(tmp_path))
+    monkeypatch.setenv(ENV_MODEL, "Xenova/bge-base-en-v1.5")
+    cfg = load_config()
+    assert cfg.model == "Xenova/bge-base-en-v1.5"
+    assert cfg.preset_short_name is None
+
+
+def test_load_config_model_legacy_alias_expanded(monkeypatch, tmp_path, capsys):
+    """Legacy short-name preserved with deprecation warning + expansion."""
     monkeypatch.setenv(ENV_DATA_DIR, str(tmp_path))
     monkeypatch.setenv(ENV_MODEL, "bge-base-en-v1.5")
     cfg = load_config()
-    assert cfg.model == "bge-base-en-v1.5"
+    assert cfg.model == "Xenova/bge-base-en-v1.5"
+    assert cfg.preset_short_name == "english-quality"
+    captured = capsys.readouterr()
+    assert "deprecated" in captured.err.lower()
+
+
+# ---------------------------------------------------------------------------
+# EMBEDDING_PRESET wiring through load_config
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize("name", list(EMBEDDING_PRESETS.keys()))
+def test_load_config_preset_env_wires_atomically(monkeypatch, tmp_path, name):
+    """`EMBEDDING_PRESET=<name>` populates provider/model/preset_short_name
+    atomically — the resolver runs inside load_config and the dataclass
+    carries all three."""
+    monkeypatch.setenv(ENV_DATA_DIR, str(tmp_path))
+    monkeypatch.setenv(ENV_PRESET, name)
+    cfg = load_config()
+    preset = EMBEDDING_PRESETS[name]
+    assert cfg.provider == preset.provider
+    assert cfg.model == preset.model
+    assert cfg.preset_short_name == name
+
+
+def test_load_config_preset_alias_emits_warning(monkeypatch, tmp_path, capsys):
+    """A deprecated alias in EMBEDDING_PRESET still surfaces the warning
+    through load_config."""
+    monkeypatch.setenv(ENV_DATA_DIR, str(tmp_path))
+    monkeypatch.setenv(ENV_PRESET, "fastest")
+    cfg = load_config()
+    assert cfg.preset_short_name == "english-fast"
+    captured = capsys.readouterr()
+    assert "deprecated" in captured.err.lower()
+
+
+def test_load_config_preset_unknown_rejected(monkeypatch, tmp_path):
+    monkeypatch.setenv(ENV_DATA_DIR, str(tmp_path))
+    monkeypatch.setenv(ENV_PRESET, "not-a-real-preset")
+    with pytest.raises(ValueError, match="EMBEDDING_PRESET"):
+        load_config()
+
+
+def test_load_config_preset_provider_mismatch_warning(monkeypatch, tmp_path, capsys):
+    """EMBEDDING_PROVIDER=ollama + EMBEDDING_PRESET=english → provider wins,
+    preset's model carried, warning emitted."""
+    monkeypatch.setenv(ENV_DATA_DIR, str(tmp_path))
+    monkeypatch.setenv(ENV_PRESET, "english")
+    monkeypatch.setenv(ENV_PROVIDER, "ollama")
+    cfg = load_config()
+    assert cfg.provider == "ollama"
+    assert cfg.model == "Xenova/bge-small-en-v1.5"
+    assert cfg.preset_short_name == "english"
+    captured = capsys.readouterr()
+    assert "overrides EMBEDDING_PRESET" in captured.err
+
+
+def test_load_config_provider_alone_no_preset(monkeypatch, tmp_path):
+    """`EMBEDDING_PROVIDER=ollama` alone falls into branch (4): provider-default
+    model (`nomic-embed-text`), preset_short_name is None."""
+    monkeypatch.setenv(ENV_DATA_DIR, str(tmp_path))
+    monkeypatch.setenv(ENV_PROVIDER, "ollama")
+    cfg = load_config()
+    assert cfg.provider == "ollama"
+    assert cfg.model == "nomic-embed-text"
+    assert cfg.preset_short_name is None
 
 
 def test_load_config_debug_flag(monkeypatch, tmp_path):
