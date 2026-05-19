@@ -243,12 +243,13 @@ def reindex_semantic(force: bool = False) -> dict:
     longer present in the source. Returns stats:
     `notes_seen / notes_indexed / notes_skipped / notes_deleted /
     chunks_embedded / chunks_skipped / chunks_failed / took_ms /
-    failures / failed_chunks_cleared`.
+    failures / prior_failures_cleared`.
 
     `force=True` clears the persistent `failed_chunks` table before
     indexing. Use this when `semantic_index_status` reports stale
     `total_failed_chunks` after you've resolved the underlying issue
-    (e.g. unlocked a previously-locked note).
+    (e.g. fixed a too-long chunk). Locked-note placeholders are also
+    wiped but recreate on the next pass.
 
     First call on a fresh install downloads the ONNX model
     (~30MB) before indexing — may take a minute.
@@ -261,12 +262,15 @@ def semantic_index_status() -> dict:
     """Snapshot of the semantic index + embedder configuration.
 
     Useful for troubleshooting: shows total nodes/chunks indexed,
-    `total_failed_chunks` count + `failed_chunk_ids` sample (up to 50
-    most-recent), `embedder_warm` (True iff the ONNX runtime is
-    initialised — False means the next query pays the warm-up cost),
-    last_indexed_at, active embedder provider / model / dim, ONNX
-    execution providers in use (e.g. CoreMLExecutionProvider on macOS
-    Apple Silicon), and the data/db paths.
+    `locked_notes` (password-protected notes skipped by design),
+    `total_failed_chunks` (real failures only — locked excluded) +
+    `failed_chunks_by_reason` breakdown + `failed_chunk_ids` sample
+    (up to 50 most-recent real failures), `embedder_warm` (True iff
+    the ONNX runtime is initialised — False means the next query
+    pays the warm-up cost), last_indexed_at, active embedder
+    provider / model / dim, ONNX execution providers in use (e.g.
+    CoreMLExecutionProvider on macOS Apple Silicon), and the
+    data/db paths.
     """
     return tools_semantic.semantic_index_status()
 

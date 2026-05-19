@@ -8,10 +8,14 @@ import pytest
 from apple_notes_brain.semantic.store import (
     all_node_ids,
     all_sync_node_ids,
+    clear_failed_chunks,
     count_failed_chunks,
+    count_failed_chunks_by_reason,
     get_chunk,
     get_node,
     get_sync,
+    index_status,
+    list_failed_chunk_ids,
     open_db,
     record_failed_chunk,
     set_sync,
@@ -258,3 +262,60 @@ def test_record_failed_chunk_overwrites_on_same_id(conn):
 
 def test_count_failed_chunks_empty(conn):
     assert count_failed_chunks(conn) == 0
+
+
+# ---------------------------------------------------------------------------
+# v1.1 Part 4 Phase 1 — locked-vs-failed partition at the store layer
+# ---------------------------------------------------------------------------
+
+def test_count_failed_chunks_by_reason(conn):
+    for i in range(3):
+        record_failed_chunk(conn, chunk_id=f"l-{i}", node_id=f"n-l-{i}", reason="locked")
+    record_failed_chunk(conn, chunk_id="tl-0", node_id="n-tl-0", reason="too-long")
+    record_failed_chunk(conn, chunk_id="ee-0", node_id="n-ee-0", reason="embed-error")
+    by_reason = count_failed_chunks_by_reason(conn)
+    assert by_reason == {"locked": 3, "too-long": 1, "embed-error": 1}
+
+
+def test_count_failed_chunks_by_reason_empty(conn):
+    assert count_failed_chunks_by_reason(conn) == {}
+
+
+def test_clear_failed_chunks_returns_real_failure_count_only(conn):
+    """clear_failed_chunks deletes ALL rows (so the next pass can
+    re-validate locked notes) but reports only the real-failure count
+    so callers don't see a misleading 'cleared 9' when none of those
+    9 were actually failures."""
+    for i in range(4):
+        record_failed_chunk(conn, chunk_id=f"l-{i}", node_id=f"n-l-{i}", reason="locked")
+    record_failed_chunk(conn, chunk_id="tl-0", node_id="n-tl-0", reason="too-long")
+    record_failed_chunk(conn, chunk_id="tl-1", node_id="n-tl-1", reason="too-long")
+    real = clear_failed_chunks(conn)
+    assert real == 2  # only the two too-long, not the 4 locked
+    assert count_failed_chunks(conn) == 0  # but all 6 rows are gone
+
+
+def test_index_status_partitions_locked_from_failed(conn):
+    """index_status separates locked_notes from total_failed_chunks."""
+    for i in range(5):
+        record_failed_chunk(conn, chunk_id=f"l-{i}", node_id=f"n-l-{i}", reason="locked")
+    record_failed_chunk(conn, chunk_id="tl-0", node_id="n-tl-0", reason="too-long")
+    s = index_status(conn)
+    assert s.locked_notes == 5
+    assert s.total_failed_chunks == 1
+    assert s.failed_chunks_by_reason == {"too-long": 1}
+
+
+def test_list_failed_chunk_ids_excludes_locked_by_default(conn):
+    for i in range(3):
+        record_failed_chunk(conn, chunk_id=f"l-{i}", node_id=f"n-l-{i}", reason="locked")
+    record_failed_chunk(conn, chunk_id="tl-0", node_id="n-tl-0", reason="too-long")
+    ids = list_failed_chunk_ids(conn)
+    assert ids == ["tl-0"]
+
+
+def test_list_failed_chunk_ids_with_exclude_locked_false_returns_all(conn):
+    record_failed_chunk(conn, chunk_id="l-0", node_id="n-l-0", reason="locked")
+    record_failed_chunk(conn, chunk_id="tl-0", node_id="n-tl-0", reason="too-long")
+    ids = list_failed_chunk_ids(conn, exclude_locked=False)
+    assert set(ids) == {"l-0", "tl-0"}

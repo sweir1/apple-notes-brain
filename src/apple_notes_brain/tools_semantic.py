@@ -398,6 +398,11 @@ def reindex_semantic(force: bool = False) -> dict[str, Any]:
     inflating `semantic_index_status.total_failed_chunks` after the
     underlying issue has been resolved. Without `force`, the table is
     left intact (incremental passes only add entries on new failure).
+
+    `prior_failures_cleared` in the response counts the real failures
+    cleared by `force=True` (too-long, embed-error). Locked-note
+    placeholders are also wiped under the hood but they re-create on
+    the next pass and don't count here.
     """
     if not HAVE_SEMANTIC:
         return _missing()
@@ -416,7 +421,7 @@ def reindex_semantic(force: bool = False) -> dict[str, Any]:
         "chunks_failed": stats.chunks_failed,
         "took_ms": stats.took_ms,
         "failures": stats.failures[:20],  # cap surfaced failures
-        "failed_chunks_cleared": cleared,
+        "prior_failures_cleared": cleared,
     }
 
 
@@ -428,9 +433,15 @@ def semantic_index_status() -> dict[str, Any]:
     before this call). Callers can use this to warn users that the
     first query will be slow while the ONNX runtime spins up.
 
+    `locked_notes` counts password-protected notes that can't be
+    indexed without unlocking — this is expected, not a failure.
+    `total_failed_chunks` only counts real failures (`too-long`,
+    `embed-error`); `failed_chunks_by_reason` breaks them down.
+
     Also includes `failed_chunk_ids: list[str]` — the IDs of up to 50
-    chunks currently in `failed_chunks`, most-recent first. If
-    `total_failed_chunks > 50`, the list is truncated and the final
+    real-failure chunks, most-recent first. Locked-note placeholders
+    are excluded from this list (they correspond to `locked_notes`).
+    If `total_failed_chunks > 50`, the list is truncated and the final
     entry is suffixed with ' (truncated)'.
     """
     if not HAVE_SEMANTIC:
@@ -458,6 +469,8 @@ def semantic_index_status() -> dict[str, Any]:
         "total_nodes": s.total_nodes,
         "total_chunks": s.total_chunks,
         "total_failed_chunks": s.total_failed_chunks,
+        "failed_chunks_by_reason": s.failed_chunks_by_reason,
+        "locked_notes": s.locked_notes,
         "failed_chunk_ids": failed_ids,
         "chunks_vec_dim": s.chunks_vec_dim,
         "last_indexed_at": s.last_indexed_at,

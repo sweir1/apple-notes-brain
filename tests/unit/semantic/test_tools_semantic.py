@@ -195,7 +195,8 @@ def test_status_returns_keys(state):
     status = tools_semantic.semantic_index_status()
     expected_keys = {
         "schema_version", "total_nodes", "total_chunks",
-        "total_failed_chunks", "chunks_vec_dim", "last_indexed_at",
+        "total_failed_chunks", "locked_notes", "failed_chunks_by_reason",
+        "chunks_vec_dim", "last_indexed_at",
         "vec_version", "embedder_provider", "embedder_model",
         "embedder_dim", "onnx_providers", "data_dir", "db_path",
     }
@@ -452,24 +453,38 @@ def test_search_page_hint_field_accepted():
 # ---------------------------------------------------------------------------
 
 def test_reindex_force_clears_failed_chunks(state):
-    """force=True should drop every row in failed_chunks at the start."""
+    """force=True should drop every real-failure row in failed_chunks at the start.
+
+    Locked-row deletes are NOT counted in `prior_failures_cleared` —
+    locked notes aren't failures, just expected placeholders that
+    re-create on the next pass.
+    """
     from apple_notes_brain.semantic.store import record_failed_chunk, count_failed_chunks
 
-    # Seed a few stale failures.
+    # Seed 5 real failures (too-long) and 2 locked placeholders.
     for i in range(5):
         record_failed_chunk(
             state.conn,
-            chunk_id=f"zid-stale-{i}#0",
-            node_id=f"zid-stale-{i}",
-            reason="locked",
-            error_message="stale failure",
+            chunk_id=f"zid-toolong-{i}#0",
+            node_id=f"zid-toolong-{i}",
+            reason="too-long",
+            error_message="exceeds capacity",
         )
-    assert count_failed_chunks(state.conn) == 5
+    for i in range(2):
+        record_failed_chunk(
+            state.conn,
+            chunk_id=f"zid-locked-{i}#0",
+            node_id=f"zid-locked-{i}",
+            reason="locked",
+            error_message="password-protected",
+        )
+    assert count_failed_chunks(state.conn) == 7
 
     stats = tools_semantic.reindex_semantic(force=True)
-    assert stats["failed_chunks_cleared"] == 5
-    # After the pass, no stale failures remain (the indexed corpus has no
-    # locked notes either, so the count is 0).
+    # Only the 5 real failures count toward "prior_failures_cleared".
+    assert stats["prior_failures_cleared"] == 5
+    # After the pass, all rows are gone (the indexed corpus has no
+    # locked notes either, so the locked rows don't re-create).
     assert count_failed_chunks(state.conn) == 0
 
 
@@ -481,13 +496,13 @@ def test_reindex_default_does_not_clear_failed_chunks(state):
         state.conn,
         chunk_id="zid-stale#0",
         node_id="zid-stale",
-        reason="locked",
+        reason="too-long",
         error_message="stale failure",
     )
     assert count_failed_chunks(state.conn) == 1
 
     stats = tools_semantic.reindex_semantic()  # force defaults to False
-    assert stats.get("failed_chunks_cleared", 0) == 0
+    assert stats.get("prior_failures_cleared", 0) == 0
     # Row still present.
     assert count_failed_chunks(state.conn) == 1
 
@@ -497,26 +512,104 @@ def test_reindex_force_with_empty_table_returns_zero_cleared(state):
 
     assert count_failed_chunks(state.conn) == 0
     stats = tools_semantic.reindex_semantic(force=True)
-    assert stats["failed_chunks_cleared"] == 0
+    assert stats["prior_failures_cleared"] == 0
 
 
 def test_reindex_force_then_status_shows_zero_failed(state):
-    """End-to-end: stale failures, force-reindex, status shows clean."""
+    """End-to-end: stale real failures, force-reindex, status shows clean."""
     from apple_notes_brain.semantic.store import record_failed_chunk
 
     for i in range(3):
         record_failed_chunk(
             state.conn,
             chunk_id=f"chunk-{i}", node_id=f"node-{i}",
-            reason="locked", error_message="x",
+            reason="too-long", error_message="x",
         )
     status_before = tools_semantic.semantic_index_status()
     assert status_before["total_failed_chunks"] == 3
+    assert status_before["failed_chunks_by_reason"].get("too-long") == 3
 
     tools_semantic.reindex_semantic(force=True)
     status_after = tools_semantic.semantic_index_status()
     assert status_after["total_failed_chunks"] == 0
     assert status_after["failed_chunk_ids"] == []
+
+
+# ---------------------------------------------------------------------------
+# v1.1 Part 4 Phase 1 — locked notes are NOT failures
+# ---------------------------------------------------------------------------
+
+def test_locked_notes_excluded_from_total_failed_chunks(state):
+    """Locked-note placeholders sit under `locked_notes`, not
+    `total_failed_chunks`."""
+    from apple_notes_brain.semantic.store import record_failed_chunk
+
+    for i in range(9):
+        record_failed_chunk(
+            state.conn,
+            chunk_id=f"zid-locked-{i}#0",
+            node_id=f"zid-locked-{i}",
+            reason="locked",
+            error_message="password-protected",
+        )
+    status = tools_semantic.semantic_index_status()
+    assert status["locked_notes"] == 9
+    assert status["total_failed_chunks"] == 0
+    # Locked rows do NOT appear in the breakdown either.
+    assert "locked" not in status["failed_chunks_by_reason"]
+    # And their IDs are excluded from the surfaced failed_chunk_ids.
+    assert status["failed_chunk_ids"] == []
+
+
+def test_failed_chunks_by_reason_breakdown(state):
+    """Mixed scenario: 5 locked + 1 too-long + 1 embed-error →
+    locked_notes=5, total_failed_chunks=2."""
+    from apple_notes_brain.semantic.store import record_failed_chunk
+
+    for i in range(5):
+        record_failed_chunk(
+            state.conn,
+            chunk_id=f"locked-{i}",
+            node_id=f"node-locked-{i}",
+            reason="locked",
+            error_message="x",
+        )
+    record_failed_chunk(
+        state.conn, chunk_id="toolong-0", node_id="node-tl-0",
+        reason="too-long", error_message="exceeded budget",
+    )
+    record_failed_chunk(
+        state.conn, chunk_id="embed-0", node_id="node-em-0",
+        reason="embed-error", error_message="onnx threw",
+    )
+    status = tools_semantic.semantic_index_status()
+    assert status["locked_notes"] == 5
+    assert status["total_failed_chunks"] == 2
+    assert status["failed_chunks_by_reason"] == {
+        "too-long": 1, "embed-error": 1,
+    }
+    # failed_chunk_ids surfaces only the 2 real failures (order: most-recent first).
+    assert set(status["failed_chunk_ids"]) == {"toolong-0", "embed-0"}
+
+
+def test_force_reindex_clears_locked_but_doesnt_count_them(state):
+    """force=True deletes locked rows too (so the next pass can
+    re-validate) but they don't count toward prior_failures_cleared."""
+    from apple_notes_brain.semantic.store import record_failed_chunk, count_failed_chunks
+
+    for i in range(4):
+        record_failed_chunk(
+            state.conn,
+            chunk_id=f"locked-{i}", node_id=f"n-{i}",
+            reason="locked", error_message="x",
+        )
+    assert count_failed_chunks(state.conn) == 4
+
+    stats = tools_semantic.reindex_semantic(force=True)
+    # 0 real failures cleared (everything was locked).
+    assert stats["prior_failures_cleared"] == 0
+    # All rows gone.
+    assert count_failed_chunks(state.conn) == 0
 
 
 # ---------------------------------------------------------------------------
@@ -572,7 +665,7 @@ def test_status_failed_chunk_ids_truncated_at_50():
                 record_failed_chunk(
                     conn, chunk_id=f"chunk-{i:03d}",
                     node_id=f"node-{i:03d}",
-                    reason="locked", error_message="x",
+                    reason="too-long", error_message="x",
                 )
             search = Search(conn, emb)
             src = FakeNotesSource()

@@ -616,36 +616,73 @@ def record_failed_chunk(
 
 
 def count_failed_chunks(conn: sqlite3.Connection) -> int:
+    """Total failed_chunks rows, including `reason='locked'` placeholders.
+
+    Prefer `count_failed_chunks_by_reason` + the split in
+    `IndexStatus.total_failed_chunks` / `IndexStatus.locked_notes` for
+    user-facing reporting — locked notes aren't failures.
+    """
     return int(conn.execute("SELECT COUNT(*) FROM failed_chunks").fetchone()[0])
+
+
+def count_failed_chunks_by_reason(
+    conn: sqlite3.Connection,
+) -> dict[str, int]:
+    rows = conn.execute(
+        "SELECT reason, COUNT(*) FROM failed_chunks GROUP BY reason"
+    ).fetchall()
+    return {str(r[0]): int(r[1]) for r in rows}
 
 
 def clear_failed_chunks(conn: sqlite3.Connection) -> int:
     """Delete every row from failed_chunks. Returns the row count
-    deleted. Used by `reindex_semantic(force=True)` to reset the
-    persistent failure counter that otherwise sticks around even after
-    the original failure has been resolved by a subsequent successful
-    pass."""
-    count = count_failed_chunks(conn)
+    deleted, excluding `reason='locked'` placeholders (locked notes
+    are an expected state, not a failure to "clear").
+
+    Used by `reindex_semantic(force=True)` to reset the persistent
+    failure counter that otherwise sticks around even after the
+    original failure has been resolved by a subsequent successful
+    pass. The cleared-count returned to the caller maps to
+    `prior_failures_cleared` in the tool response — locked-row deletes
+    are not user-visible because they re-create on the next pass.
+    """
+    real_failures = int(
+        conn.execute(
+            "SELECT COUNT(*) FROM failed_chunks WHERE reason != 'locked'"
+        ).fetchone()[0]
+    )
     conn.execute("DELETE FROM failed_chunks")
-    return count
+    return real_failures
 
 
 def list_failed_chunk_ids(
-    conn: sqlite3.Connection, *, limit: int = 50
+    conn: sqlite3.Connection,
+    *,
+    limit: int = 50,
+    exclude_locked: bool = True,
 ) -> list[str]:
     """Return up to `limit` failed chunk IDs, most-recent first.
 
     Used by `semantic_index_status` to surface which chunks are
     currently failing so the caller can correlate with the
-    `total_failed_chunks` counter.
+    `total_failed_chunks` counter. By default excludes
+    `reason='locked'` rows — those aren't failures, they're expected
+    placeholders for password-protected notes (surfaced under
+    `locked_notes` instead).
     """
     if limit <= 0:
         return []
-    rows = conn.execute(
-        "SELECT chunk_id FROM failed_chunks "
-        "ORDER BY failed_at DESC, chunk_id ASC LIMIT ?",
-        (int(limit),),
-    ).fetchall()
+    if exclude_locked:
+        sql = (
+            "SELECT chunk_id FROM failed_chunks WHERE reason != 'locked' "
+            "ORDER BY failed_at DESC, chunk_id ASC LIMIT ?"
+        )
+    else:
+        sql = (
+            "SELECT chunk_id FROM failed_chunks "
+            "ORDER BY failed_at DESC, chunk_id ASC LIMIT ?"
+        )
+    rows = conn.execute(sql, (int(limit),)).fetchall()
     return [str(r[0]) for r in rows]
 
 
@@ -657,7 +694,9 @@ def list_failed_chunk_ids(
 class IndexStatus:
     total_nodes: int
     total_chunks: int
-    total_failed_chunks: int
+    total_failed_chunks: int  # excludes reason='locked'
+    locked_notes: int  # reason='locked' placeholders only
+    failed_chunks_by_reason: dict[str, int]  # excludes 'locked' key
     chunks_vec_dim: int | None
     schema_version: int
     last_indexed_at: int | None
@@ -672,10 +711,15 @@ def index_status(conn: sqlite3.Connection) -> IndexStatus:
         vec_version = conn.execute("SELECT vec_version()").fetchone()[0]
     except sqlite3.OperationalError:
         vec_version = None
+    by_reason = count_failed_chunks_by_reason(conn)
+    locked_notes = by_reason.pop("locked", 0)
+    real_failures = sum(by_reason.values())
     return IndexStatus(
         total_nodes=total_nodes,
         total_chunks=total_chunks,
-        total_failed_chunks=count_failed_chunks(conn),
+        total_failed_chunks=real_failures,
+        locked_notes=locked_notes,
+        failed_chunks_by_reason=by_reason,
         chunks_vec_dim=chunks_vec_dim(conn),
         schema_version=current_schema_version(conn),
         last_indexed_at=int(last_indexed) if last_indexed else None,
