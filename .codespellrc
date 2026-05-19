@@ -1,0 +1,13 @@
+[codespell]
+# Identifiers that codespell's default dictionary treats as typos but are
+# actually legitimate terms in this repo. Keep the list small — if you
+# find yourself adding a real typo here, fix the typo instead.
+#
+# - afterall / afterAll: pytest lifecycle parallel to obsidian-brain's vitest
+#   afterAll usage; aligned across the -brain family.
+# - applescript: legitimate proper noun for Apple's automation language.
+# - bge: BAAI's BGE embedding family (Xenova/bge-small-en-v1.5 et al).
+# - iCloud: Apple service name.
+# - markdownify: PyPI package name.
+# - nd: short for "and" in compact comments; flagged false-positive.
+ignore-words-list = afterall,applescript,bge,iCloud,markdownify,nd

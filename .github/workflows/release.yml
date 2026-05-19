@@ -88,7 +88,12 @@ jobs:
             exit 1
           fi
           echo "✓ server.json versions match: ${tag_version}"
-          echo "::warning title=server.json env vars::Reminder: server.json environmentVariables are NOT auto-synced. If you added new env vars in code since the last release, hand-edit server.json before tagging."
+
+      - name: env-var drift check (server.json ↔ src/)
+        # check_env_vars.py replaces the old manual reminder: any env var
+        # read in src/ but missing from server.json hard-fails here.
+        run: |
+          python3 scripts/check_env_vars.py
 
   # ----------------------------------------------------------------------
   # Job 2 — Run the unit test suite.
@@ -286,3 +291,46 @@ jobs:
         #   - Reading dist/*.whl + dist/*.tar.gz
         #   - Authenticating via OIDC (because id-token: write is set)
         #   - Generating PEP 740 attestations automatically
+
+  # ----------------------------------------------------------------------
+  # Job 5 — Publish server metadata to the MCP Registry.
+  # https://registry.modelcontextprotocol.io/
+  #
+  # The MCP Registry only hosts metadata, not artifacts — so PyPI must
+  # succeed first (the `needs: publish` gate).
+  #
+  # Authentication is GitHub OIDC ("github-oidc"). No secrets required —
+  # mcp-publisher exchanges the GitHub Actions OIDC token for a registry
+  # JWT scoped to the `io.github.sweir1/*` namespace.
+  #
+  # PyPI verification: the registry validates that apple-notes-brain's
+  # PyPI README contains `mcp-name: io.github.sweir1/apple-notes-brain`
+  # (HTML comment in README.md). If that line is missing, publish fails
+  # with "Registry validation failed for package".
+  # ----------------------------------------------------------------------
+  publish-mcp-registry:
+    name: Publish to MCP Registry
+    needs: publish
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write   # mandatory for github-oidc auth
+      contents: read
+    steps:
+      - name: Checkout (need server.json)
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+
+      - name: Install mcp-publisher
+        run: |
+          set -euo pipefail
+          os=$(uname -s | tr '[:upper:]' '[:lower:]')
+          arch=$(uname -m | sed 's/x86_64/amd64/;s/aarch64/arm64/')
+          curl -fsSL "https://github.com/modelcontextprotocol/registry/releases/latest/download/mcp-publisher_${os}_${arch}.tar.gz" \
+            | tar xz mcp-publisher
+          ./mcp-publisher --help >/dev/null
+          echo "✓ mcp-publisher installed"
+
+      - name: Authenticate to MCP Registry (GitHub OIDC)
+        run: ./mcp-publisher login github-oidc
+
+      - name: Publish server.json to MCP Registry
+        run: ./mcp-publisher publish
