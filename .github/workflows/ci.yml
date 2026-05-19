@@ -84,6 +84,68 @@ jobs:
         # separate venv-without-extras CI job for that.
         run: uv sync --extra dev --extra semantic
 
+      - name: Restore MTEB venv (for seed-drift check)
+        # MTEB ships torch + datasets + ~30 other heavy deps; install
+        # takes ~60s. We cache the FULL populated venv at ~/.venv-mteb
+        # (not just the pip wheel cache) so a cache hit skips pip
+        # entirely and we go straight to running build-seed.py.
+        #
+        # Restore-only on validate; the SAVE lives in the `warm-mteb-venv`
+        # job below which runs on main pushes only. PRs / dev pushes read
+        # main's cache via cross-ref fallthrough; if main has never warmed
+        # the cache, this restore is a miss and we skip the drift check
+        # (see `continue-on-error: true` + the `if` guard on the next step).
+        #
+        # Cache key shape (mteb-venv-<os>-<arch>-py<full-patch>-<reqs-hash>-v1):
+        # py<full-patch> is CRITICAL — venv shebangs and torch native ABI
+        # break on Python patch drift. No restore-keys fallback for the
+        # same reason: a partial cache miss is preferable to restoring a
+        # venv that segfaults on import.
+        uses: actions/cache/restore@v5
+        continue-on-error: true
+        id: mteb-venv-restore
+        with:
+          path: ~/.venv-mteb
+          key: mteb-venv-${{ runner.os }}-${{ runner.arch }}-py${{ steps.setup-uv.outputs.python-version || '3.11' }}-${{ hashFiles('scripts/requirements-build-seed.txt') }}-v1
+
+      - name: Seed-drift check (cache hit only)
+        # If the MTEB venv was warmed by a prior main push (cross-ref
+        # fallthrough), regenerate the seed JSON and assert it matches
+        # the committed src/apple_notes_brain/data/seed-models.json.
+        # Drift = author committed source changes that bumped the seed
+        # output without committing the new seed; fail with a clear
+        # remediation message.
+        #
+        # If the cache MISSED (e.g. first PR after a key change, or
+        # main has never warmed), skip the check — we don't want every
+        # PR to pay the 60s MTEB install cost. The `warm-mteb-venv` job
+        # on main pushes ensures the cache is populated for descendants.
+        if: steps.mteb-venv-restore.outputs.cache-hit == 'true'
+        run: |
+          set -euo pipefail
+          tmp=$(mktemp -d)
+          cp src/apple_notes_brain/data/seed-models.json "$tmp/committed.json"
+          ~/.venv-mteb/bin/python scripts/build-seed.py
+          # Compare model dict only — ignore $generatedAt timestamp drift
+          python3 - <<PYEOF
+          import json, sys
+          committed = json.load(open("$tmp/committed.json"))["models"]
+          regen = json.load(open("src/apple_notes_brain/data/seed-models.json"))["models"]
+          if committed != regen:
+              missing_in_committed = set(regen) - set(committed)
+              missing_in_regen = set(committed) - set(regen)
+              changed = [k for k in set(regen) & set(committed) if regen[k] != committed[k]]
+              print("::error title=seed drift detected::seed-models.json is stale", file=sys.stderr)
+              print(f"  added by MTEB upstream: {sorted(missing_in_committed)[:10]}", file=sys.stderr)
+              print(f"  removed by MTEB upstream: {sorted(missing_in_regen)[:10]}", file=sys.stderr)
+              print(f"  prefix/max_tokens changed: {sorted(changed)[:10]}", file=sys.stderr)
+              print("Regenerate with: make refresh-seed (or scripts/build-seed.py via the MTEB venv) and commit.", file=sys.stderr)
+              sys.exit(1)
+          print(f"seed-drift check: {len(regen)} entries match committed copy")
+          PYEOF
+          # Restore the committed copy so subsequent steps see what was checked in.
+          cp "$tmp/committed.json" src/apple_notes_brain/data/seed-models.json
+
       - name: Prefetch ONNX model (so the slow integration test is fast)
         # Runs BEFORE pytest so flaky HF downloads can't surface as opaque
         # ONNX-parsing errors inside a failing test suite. Warms the cache
@@ -162,3 +224,63 @@ jobs:
           path: dist/
           retention-days: 7
           if-no-files-found: error
+
+  # ─── Warm the MTEB venv on the default-branch scope ──────────────────
+  #
+  # GitHub Actions caches are scoped per-ref. A workflow run on a tag push
+  # (release.yml) saves under that tag's ref; tags are sibling refs and
+  # CAN'T share caches with each other. The workaround: caches saved on
+  # the default branch (main) fall through to all other refs, including
+  # tags. So we save the MTEB venv here on `push: main` only, and
+  # release.yml's seed-regen step reads it via cross-ref fallthrough.
+  #
+  # Mirrors obsidian-brain `.github/workflows/ci.yml`'s `warm-mteb-venv`
+  # job. ~/.venv-mteb is ~700MB after MTEB + torch + datasets are
+  # installed; caching the populated venv (rather than ~/.cache/pip)
+  # drops ~60s of `pip install` to ~1s on hit.
+  warm-mteb-venv:
+    name: Warm MTEB venv (main only)
+    runs-on: ubuntu-latest
+    # Only main pushes — not dev, not PRs. Cache scope on main falls
+    # through to release.yml's tag-triggered runs.
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+
+      - name: Setup Python 3.11
+        id: setup-python
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.11'
+          # No `cache: pip` — we manage the full venv cache below.
+
+      - name: Restore MTEB venv
+        uses: actions/cache/restore@v5
+        continue-on-error: true
+        id: mteb-venv-restore
+        with:
+          path: ~/.venv-mteb
+          key: mteb-venv-${{ runner.os }}-${{ runner.arch }}-py${{ steps.setup-python.outputs.python-version }}-${{ hashFiles('scripts/requirements-build-seed.txt') }}-v1
+
+      - name: Create venv + install mteb (cache miss only)
+        if: steps.mteb-venv-restore.outputs.cache-hit != 'true'
+        id: install-mteb
+        run: |
+          python -m venv ~/.venv-mteb
+          ~/.venv-mteb/bin/pip install --upgrade pip
+          ~/.venv-mteb/bin/pip install -r scripts/requirements-build-seed.txt
+
+      - name: Save MTEB venv
+        # Save ONLY when install succeeded (avoids persisting a venv
+        # whose pip install was killed mid-write) AND we were a cache
+        # miss (an exact-key hit means nothing changed).
+        if: steps.install-mteb.outcome == 'success' && steps.mteb-venv-restore.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v5
+        continue-on-error: true
+        with:
+          path: ~/.venv-mteb
+          key: mteb-venv-${{ runner.os }}-${{ runner.arch }}-py${{ steps.setup-python.outputs.python-version }}-${{ hashFiles('scripts/requirements-build-seed.txt') }}-v1

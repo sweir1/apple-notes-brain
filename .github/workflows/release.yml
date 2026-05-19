@@ -151,6 +151,39 @@ jobs:
             hf-models-bge-small-en-v1.5-
             hf-models-
 
+      - name: Restore MTEB venv (for seed regeneration)
+        # Restore-only — saves live in ci.yml's warm-mteb-venv job on
+        # main pushes. Same cross-ref fallthrough principle as the HF
+        # model cache above; release runs read main's cache.
+        #
+        # Patch-version pinned because torch/scipy ABI breaks on Python
+        # patch drift. No restore-keys fallback for the same reason.
+        uses: actions/cache/restore@v5
+        continue-on-error: true
+        id: mteb-venv-restore
+        with:
+          path: ~/.venv-mteb
+          key: mteb-venv-${{ runner.os }}-${{ runner.arch }}-py${{ steps.setup-python.outputs.python-version || '3.11' }}-${{ hashFiles('scripts/requirements-build-seed.txt') }}-v1
+
+      - name: Regenerate seed-models.json from MTEB (cache hit only)
+        # If the MTEB venv is warm, regenerate the bundled seed JSON so
+        # the release tarball ships the freshest model metadata that
+        # MTEB upstream knows about. Zero HF API calls — MTEB packs its
+        # own curated prompts + max_tokens for every model.
+        #
+        # `continue-on-error: true` means a failed regen (mteb upgrade
+        # broke our extractor; flake) does NOT block the release. The
+        # committed anchor at src/apple_notes_brain/data/seed-models.json
+        # still ships in the wheel.
+        if: steps.mteb-venv-restore.outputs.cache-hit == 'true'
+        run: ~/.venv-mteb/bin/python scripts/build-seed.py
+        continue-on-error: true
+
+      - name: Validate regenerated seed parses
+        if: steps.mteb-venv-restore.outputs.cache-hit == 'true'
+        run: |
+          python3 -c "import json; d = json.load(open('src/apple_notes_brain/data/seed-models.json')); assert len(d['models']) > 0, 'empty seed'; print(f'seed: {len(d[\"models\"])} models')"
+
       - name: Install dependencies
         # Both extras so the semantic test suite collects + runs.
         run: uv sync --extra dev --extra semantic
