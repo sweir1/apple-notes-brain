@@ -180,6 +180,7 @@ def semantic_search(
     query: str,
     limit: int = 20,
     unique: str = "notes",
+    include_trash: bool = False,
 ) -> SearchPage | dict:
     """Embedding-based semantic search over chunked note bodies.
 
@@ -192,11 +193,15 @@ def semantic_search(
     - unique: 'notes' (default, dedups multi-chunk hits per note,
        keeping the highest-scoring chunk) or 'chunks' (chunk-grained,
        returns every match).
+    - include_trash: default False (excludes Apple's 'Recently Deleted'
+       folder). Matches list_notes / search_notes defaults.
 
     Requires the [semantic] install extra (ONNX runtime + tokenizers +
     sqlite-vec). Without it, returns a `missing-extras` error envelope.
     """
-    return tools_semantic.semantic_search(query, limit=limit, unique=unique)  # type: ignore[arg-type]
+    return tools_semantic.semantic_search(
+        query, limit=limit, unique=unique, include_trash=include_trash,
+    )  # type: ignore[arg-type]
 
 
 @_mcp_tool(annotations=READ_ONLY)
@@ -204,15 +209,29 @@ def hybrid_search(
     query: str,
     limit: int = 20,
     unique: str = "notes",
+    include_trash: bool = False,
 ) -> SearchPage | dict:
     """Reciprocal-rank-fused semantic + lexical search. Higher recall
     than either alone for most queries.
 
-    Same envelope as semantic_search. Each result carries both
-    `semantic_score` and `lexical_score` so the caller can render
-    provenance ("matched semantically + lexically"). RRF k=60.
+    Same envelope as semantic_search. Each result carries strict score
+    provenance so the caller can render "matched semantically + lexically":
+
+      * `semantic_score`: raw cosine similarity from the semantic ranker.
+        Set iff this hit appeared in the kNN ranker output; None
+        otherwise.
+      * `lexical_score`:  negated-BM25 from the fulltext ranker. Set
+        iff this hit appeared in the fulltext ranker output; None
+        otherwise.
+      * `fused_score`:    the RRF (k=60) combined score across both
+        rankers. Always set on hybrid results; this is what the result
+        list is sorted by, descending.
+
+    `include_trash`: default False (excludes Apple's 'Recently Deleted').
     """
-    return tools_semantic.hybrid_search(query, limit=limit, unique=unique)  # type: ignore[arg-type]
+    return tools_semantic.hybrid_search(
+        query, limit=limit, unique=unique, include_trash=include_trash,
+    )  # type: ignore[arg-type]
 
 
 @_mcp_tool(annotations=WRITE)
@@ -224,7 +243,12 @@ def reindex_semantic(force: bool = False) -> dict:
     longer present in the source. Returns stats:
     `notes_seen / notes_indexed / notes_skipped / notes_deleted /
     chunks_embedded / chunks_skipped / chunks_failed / took_ms /
-    failures`.
+    failures / failed_chunks_cleared`.
+
+    `force=True` clears the persistent `failed_chunks` table before
+    indexing. Use this when `semantic_index_status` reports stale
+    `total_failed_chunks` after you've resolved the underlying issue
+    (e.g. unlocked a previously-locked note).
 
     First call on a fresh install downloads the ONNX model
     (~30MB) before indexing — may take a minute.
@@ -237,9 +261,12 @@ def semantic_index_status() -> dict:
     """Snapshot of the semantic index + embedder configuration.
 
     Useful for troubleshooting: shows total nodes/chunks indexed,
-    failed_chunks count, last_indexed_at, active embedder provider /
-    model / dim, ONNX execution providers in use (e.g. CoreMLExecutionProvider
-    on macOS Apple Silicon), and the data/db paths.
+    `total_failed_chunks` count + `failed_chunk_ids` sample (up to 50
+    most-recent), `embedder_warm` (True iff the ONNX runtime is
+    initialised — False means the next query pays the warm-up cost),
+    last_indexed_at, active embedder provider / model / dim, ONNX
+    execution providers in use (e.g. CoreMLExecutionProvider on macOS
+    Apple Silicon), and the data/db paths.
     """
     return tools_semantic.semantic_index_status()
 

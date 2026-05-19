@@ -262,6 +262,7 @@ def test_note_summary_back_compat_no_semantic_fields():
     assert n.chunk_excerpt is None
     assert n.chunk_heading is None
     assert n.z_identifier is None
+    assert n.fused_score is None
 
 
 # ---------------------------------------------------------------------------
@@ -444,3 +445,261 @@ def test_search_page_hint_field_accepted():
         next_cursor=None, total_estimate=None, hint="custom advisory",
     )
     assert sp.hint == "custom advisory"
+
+
+# ---------------------------------------------------------------------------
+# v1.1 reindex force=True clears failed_chunks
+# ---------------------------------------------------------------------------
+
+def test_reindex_force_clears_failed_chunks(state):
+    """force=True should drop every row in failed_chunks at the start."""
+    from apple_notes_brain.semantic.store import record_failed_chunk, count_failed_chunks
+
+    # Seed a few stale failures.
+    for i in range(5):
+        record_failed_chunk(
+            state.conn,
+            chunk_id=f"zid-stale-{i}#0",
+            node_id=f"zid-stale-{i}",
+            reason="locked",
+            error_message="stale failure",
+        )
+    assert count_failed_chunks(state.conn) == 5
+
+    stats = tools_semantic.reindex_semantic(force=True)
+    assert stats["failed_chunks_cleared"] == 5
+    # After the pass, no stale failures remain (the indexed corpus has no
+    # locked notes either, so the count is 0).
+    assert count_failed_chunks(state.conn) == 0
+
+
+def test_reindex_default_does_not_clear_failed_chunks(state):
+    """force=False (default) must leave the failed_chunks table alone."""
+    from apple_notes_brain.semantic.store import record_failed_chunk, count_failed_chunks
+
+    record_failed_chunk(
+        state.conn,
+        chunk_id="zid-stale#0",
+        node_id="zid-stale",
+        reason="locked",
+        error_message="stale failure",
+    )
+    assert count_failed_chunks(state.conn) == 1
+
+    stats = tools_semantic.reindex_semantic()  # force defaults to False
+    assert stats.get("failed_chunks_cleared", 0) == 0
+    # Row still present.
+    assert count_failed_chunks(state.conn) == 1
+
+
+def test_reindex_force_with_empty_table_returns_zero_cleared(state):
+    from apple_notes_brain.semantic.store import count_failed_chunks
+
+    assert count_failed_chunks(state.conn) == 0
+    stats = tools_semantic.reindex_semantic(force=True)
+    assert stats["failed_chunks_cleared"] == 0
+
+
+def test_reindex_force_then_status_shows_zero_failed(state):
+    """End-to-end: stale failures, force-reindex, status shows clean."""
+    from apple_notes_brain.semantic.store import record_failed_chunk
+
+    for i in range(3):
+        record_failed_chunk(
+            state.conn,
+            chunk_id=f"chunk-{i}", node_id=f"node-{i}",
+            reason="locked", error_message="x",
+        )
+    status_before = tools_semantic.semantic_index_status()
+    assert status_before["total_failed_chunks"] == 3
+
+    tools_semantic.reindex_semantic(force=True)
+    status_after = tools_semantic.semantic_index_status()
+    assert status_after["total_failed_chunks"] == 0
+    assert status_after["failed_chunk_ids"] == []
+
+
+# ---------------------------------------------------------------------------
+# semantic_index_status — new fields
+# ---------------------------------------------------------------------------
+
+def test_status_includes_embedder_warm(state):
+    """The state singleton was injected by the fixture, so
+    embedder_warm is True on every call from inside this test."""
+    status = tools_semantic.semantic_index_status()
+    assert "embedder_warm" in status
+    assert status["embedder_warm"] is True
+
+
+def test_status_includes_failed_chunk_ids(state):
+    status = tools_semantic.semantic_index_status()
+    assert "failed_chunk_ids" in status
+    assert isinstance(status["failed_chunk_ids"], list)
+
+
+def test_status_failed_chunk_ids_truncated_at_50():
+    """When >50 failures exist, the list is capped and the last entry
+    is suffixed with ' (truncated)'."""
+    # Build a fresh state isolated from the shared fixture (which
+    # currently injects 0 failures).
+    from pathlib import Path
+    import tempfile
+
+    from apple_notes_brain.semantic.config import load_config
+    from apple_notes_brain.semantic.indexer import IndexPipeline, IndexerConfig
+    from apple_notes_brain.semantic.search import Search
+    from apple_notes_brain.semantic.source import FakeNotesSource
+    from apple_notes_brain.semantic.store import open_db, record_failed_chunk
+    from apple_notes_brain.semantic.types import ChunkerConfig
+
+    with tempfile.TemporaryDirectory() as td:
+        import os
+
+        os.environ["APPLE_NOTES_BRAIN_DATA_DIR"] = td
+        try:
+            cfg = load_config()
+            conn = open_db(cfg.db_path)
+            emb = FakeEmbedder(dim=64)
+            emb.init()
+            indexer = IndexPipeline(
+                conn, emb, IndexerConfig(chunker_config=ChunkerConfig(
+                    chunk_size=200, min_chunk_chars=10,
+                )),
+            )
+            # Build chunks_vec table by running an empty index pass.
+            indexer.prepare()
+            for i in range(60):
+                record_failed_chunk(
+                    conn, chunk_id=f"chunk-{i:03d}",
+                    node_id=f"node-{i:03d}",
+                    reason="locked", error_message="x",
+                )
+            search = Search(conn, emb)
+            src = FakeNotesSource()
+            s = tools_semantic.SemanticState(
+                conn=conn, embedder=emb, indexer=indexer,
+                search=search, source=src, config_snapshot=cfg,
+            )
+            tools_semantic.set_state_for_tests(s)
+
+            status = tools_semantic.semantic_index_status()
+            assert status["total_failed_chunks"] == 60
+            assert len(status["failed_chunk_ids"]) == 50
+            assert status["failed_chunk_ids"][-1].endswith(" (truncated)")
+        finally:
+            tools_semantic.reset_state_for_tests()
+            os.environ.pop("APPLE_NOTES_BRAIN_DATA_DIR", None)
+
+
+def test_status_failed_chunk_ids_empty_when_none_recorded(state):
+    status = tools_semantic.semantic_index_status()
+    assert status["failed_chunk_ids"] == []
+
+
+def test_status_embedder_warm_false_before_first_state_construction(monkeypatch, tmp_path):
+    """The first call to semantic_index_status (or any tool) constructs
+    the state. We exercise that by resetting the singleton FIRST and
+    then asserting embedder_warm reports False on the construction call."""
+    # Reset shared singleton.
+    tools_semantic.reset_state_for_tests()
+
+    monkeypatch.setenv("APPLE_NOTES_BRAIN_DATA_DIR", str(tmp_path))
+    # Mock create_embedder to return a FakeEmbedder so we don't trigger
+    # an ONNX model download in CI.
+    from apple_notes_brain.semantic import embedder as embedder_module
+    from apple_notes_brain import tools_semantic as ts_module
+
+    def _fake_factory(cfg):
+        e = FakeEmbedder(dim=64)
+        return e
+
+    monkeypatch.setattr(ts_module, "create_embedder", _fake_factory)
+
+    # Now call status — this is the FIRST tool call, so embedder_warm
+    # should report False (the snapshot happens before get_state runs).
+    status = tools_semantic.semantic_index_status()
+    assert status["embedder_warm"] is False
+    # The cached state is now ready; a second call reports True.
+    status2 = tools_semantic.semantic_index_status()
+    assert status2["embedder_warm"] is True
+
+    tools_semantic.reset_state_for_tests()
+
+
+# ---------------------------------------------------------------------------
+# Trash plumbing — semantic_search / hybrid_search include_trash
+# ---------------------------------------------------------------------------
+
+def test_semantic_search_default_excludes_trash(state):
+    """End-to-end: a previously-indexed note that's now in trash should
+    NOT appear in default semantic_search output. We force the note
+    into the index via include_trash=True, then verify the tool drops it."""
+    from apple_notes_brain.semantic.source import NoteRecord
+
+    # Add a trash note via include_trash=True on the indexer to bypass
+    # the index-time filter.
+    trash_rec = NoteRecord(
+        z_identifier="zid-tomb", z_pk=999, title="Tombstone",
+        folder="Recently Deleted", modified_at=1700000000,
+        locked=False, pinned=False,
+    )
+    state.source.add(trash_rec, "Pasta with garlic, olive oil — old recipe.")
+    state.indexer.index_all(state.source, include_trash=True)
+    # Default semantic_search must NOT return the trash hit.
+    out = tools_semantic.semantic_search("pasta garlic olive", limit=10)
+    ids = [r.id for r in out.results]
+    assert "zid-tomb" not in ids
+
+
+def test_semantic_search_include_trash_true_returns_trash(state):
+    from apple_notes_brain.semantic.source import NoteRecord
+
+    trash_rec = NoteRecord(
+        z_identifier="zid-tomb", z_pk=999, title="Tombstone",
+        folder="Recently Deleted", modified_at=1700000000,
+        locked=False, pinned=False,
+    )
+    state.source.add(trash_rec, "Pasta with garlic, olive oil — old recipe.")
+    state.indexer.index_all(state.source, include_trash=True)
+    out = tools_semantic.semantic_search(
+        "pasta garlic olive", limit=10, include_trash=True,
+    )
+    # Track A's id normalisation: `id` is `p<z_pk>` (short form),
+    # ZIDENTIFIER lives on `z_identifier`.
+    z_ids = [r.z_identifier for r in out.results]
+    assert "zid-tomb" in z_ids
+
+
+def test_hybrid_search_default_excludes_trash(state):
+    from apple_notes_brain.semantic.source import NoteRecord
+
+    trash_rec = NoteRecord(
+        z_identifier="zid-tomb", z_pk=999, title="Tombstone",
+        folder="Recently Deleted", modified_at=1700000000,
+        locked=False, pinned=False,
+    )
+    state.source.add(trash_rec, "Pasta with garlic, olive oil — old recipe.")
+    state.indexer.index_all(state.source, include_trash=True)
+    out = tools_semantic.hybrid_search("pasta garlic olive", limit=10)
+    ids = [r.id for r in out.results]
+    assert "zid-tomb" not in ids
+
+
+def test_hybrid_search_results_carry_fused_score(state):
+    """hybrid_search results expose fused_score on the NoteSummary."""
+    out = tools_semantic.hybrid_search("pasta", limit=5)
+    assert isinstance(out, SearchPage)
+    assert any(r.fused_score is not None for r in out.results)
+
+
+def test_hybrid_search_results_sorted_by_fused_score(state):
+    out = tools_semantic.hybrid_search("pasta", limit=10)
+    fused = [r.fused_score or 0.0 for r in out.results]
+    assert fused == sorted(fused, reverse=True)
+
+
+def test_semantic_search_match_count_is_one(state):
+    """Per the v1.1 contract change, semantic hits set match_count=1."""
+    out = tools_semantic.semantic_search("apple", limit=5)
+    for r in out.results:
+        assert r.match_count == 1

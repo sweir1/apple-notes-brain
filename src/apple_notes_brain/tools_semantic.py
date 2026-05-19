@@ -40,8 +40,12 @@ try:
     from .semantic.indexer import IndexPipeline, IndexerConfig
     from .semantic.search import Search
     from .semantic.source import AppleNotesSource, NotesSource
-    from .semantic.store import index_status as store_index_status
-    from .semantic.store import open_db
+    from .semantic.store import (
+        clear_failed_chunks,
+        index_status as store_index_status,
+        list_failed_chunk_ids,
+        open_db,
+    )
     from .semantic.types import ChunkerConfig, Embedder, IndexStats
 
     HAVE_SEMANTIC = True
@@ -196,6 +200,17 @@ def _to_note_summary(state: "SemanticState", r) -> NoteSummary:
     results between the lexical and semantic families. The original
     ZIDENTIFIER stays on the `z_identifier` field for callers that need
     cross-session stability.
+
+    Score-field semantics (v1.1):
+      * `semantic_score` is copied directly from the source ranker — None
+        if this hit didn't appear in the semantic results.
+      * `lexical_score` is copied directly from the source ranker — None
+        if this hit didn't appear in the fulltext results.
+      * `fused_score` is the RRF combined score for hybrid results; None
+        for pure-semantic / pure-lexical paths.
+      * `match_count` is set to 1 for semantic / hybrid hits — the
+        lexical search tool overloads it with a token-hit count, but
+        for chunk-level / cosine matching it's tautological.
     """
     from .semantic.store import get_node
 
@@ -215,10 +230,11 @@ def _to_note_summary(state: "SemanticState", r) -> NoteSummary:
         folder="",  # filled in below from the store if we have it
         modified="",
         snippets=[r.excerpt] if getattr(r, "excerpt", None) else [],
-        match_count=0,
+        match_count=1,
         body_preview=None,
         semantic_score=getattr(r, "semantic_score", None),
         lexical_score=getattr(r, "lexical_score", None),
+        fused_score=getattr(r, "fused_score", None),
         chunk_excerpt=getattr(r, "chunk_excerpt", None),
         chunk_heading=getattr(r, "chunk_heading", None),
         z_identifier=z_identifier,
@@ -281,9 +297,14 @@ def semantic_search(
     query: str,
     limit: int = 20,
     unique: Literal["notes", "chunks"] = "notes",
+    include_trash: bool = False,
 ) -> SearchPage | dict[str, Any]:
     """Semantic chunk-level search. Returns the same envelope shape as
-    `search_notes` so callers can swap one for the other."""
+    `search_notes` so callers can swap one for the other.
+
+    `include_trash=False` (the default) excludes results from Apple's
+    'Recently Deleted' folder. Matches the lexical search defaults.
+    """
     if not HAVE_SEMANTIC:
         return _missing()
     if not query or not query.strip():
@@ -293,7 +314,9 @@ def semantic_search(
         )
     limit = max(1, min(int(limit), 100))
     state = get_state()
-    hits = state.search.semantic_chunks(query, limit=limit, unique=unique)
+    hits = state.search.semantic_chunks(
+        query, limit=limit, unique=unique, include_trash=include_trash,
+    )
     summaries = [_to_note_summary(state, h) for h in hits]
     _enrich_with_node_metadata(state, summaries)
     hint = _empty_index_hint(state) if not summaries else None
@@ -311,9 +334,23 @@ def hybrid_search(
     query: str,
     limit: int = 20,
     unique: Literal["notes", "chunks"] = "notes",
+    include_trash: bool = False,
 ) -> SearchPage | dict[str, Any]:
     """RRF-fused semantic + lexical search. Higher-quality default for
-    most queries — combines lexical precision with semantic recall."""
+    most queries — combines lexical precision with semantic recall.
+
+    `include_trash=False` (the default) excludes results from Apple's
+    'Recently Deleted' folder.
+
+    Each result's `semantic_score`, `lexical_score`, and `fused_score`
+    fields carry strict provenance:
+      * `semantic_score` is set when (and only when) the hit appeared
+        in the kNN ranker output — i.e. it was a semantic match.
+      * `lexical_score` is set when (and only when) the hit appeared
+        in the fulltext ranker output — i.e. it was a BM25 match.
+      * `fused_score` is the RRF combined score and is set on every
+        hybrid result.
+    """
     if not HAVE_SEMANTIC:
         return _missing()
     if not query or not query.strip():
@@ -323,9 +360,20 @@ def hybrid_search(
         )
     limit = max(1, min(int(limit), 100))
     state = get_state()
-    hits = state.search.hybrid(query, limit=limit, unique=unique)
+    hits = state.search.hybrid(
+        query, limit=limit, unique=unique, include_trash=include_trash,
+    )
     summaries = [_to_note_summary(state, h) for h in hits]
     _enrich_with_node_metadata(state, summaries)
+    # Final defensive sort: order by fused_score descending so the
+    # response respects the documented RRF ordering even if a future
+    # caller appends entries to `summaries` out of order.
+    summaries.sort(
+        key=lambda s: -(
+            s.fused_score if s.fused_score is not None
+            else (s.semantic_score or s.lexical_score or 0.0)
+        )
+    )
     hint = _empty_index_hint(state) if not summaries else None
     return SearchPage(
         results=summaries,
@@ -340,13 +388,18 @@ def hybrid_search(
 def reindex_semantic(force: bool = False) -> dict[str, Any]:
     """Trigger a full index pass. Returns stats.
 
-    `force=True` is reserved for a future 'drop everything and rebuild'
-    path; today it's equivalent to the normal incremental pass because
-    content-hash dedup already minimises unnecessary work.
+    `force=True` clears the persistent `failed_chunks` table at the
+    start of the pass so that previously-recorded failures don't keep
+    inflating `semantic_index_status.total_failed_chunks` after the
+    underlying issue has been resolved. Without `force`, the table is
+    left intact (incremental passes only add entries on new failure).
     """
     if not HAVE_SEMANTIC:
         return _missing()
     state = get_state()
+    cleared = 0
+    if force:
+        cleared = clear_failed_chunks(state.conn)
     stats = state.indexer.index_all(state.source)
     return {
         "notes_seen": stats.notes_seen,
@@ -358,13 +411,29 @@ def reindex_semantic(force: bool = False) -> dict[str, Any]:
         "chunks_failed": stats.chunks_failed,
         "took_ms": stats.took_ms,
         "failures": stats.failures[:20],  # cap surfaced failures
+        "failed_chunks_cleared": cleared,
     }
 
 
 def semantic_index_status() -> dict[str, Any]:
-    """Snapshot of the index + embedder state."""
+    """Snapshot of the index + embedder state.
+
+    Includes `embedder_warm: bool` — True iff the embedder has been
+    initialised (i.e. the SemanticState singleton already existed
+    before this call). Callers can use this to warn users that the
+    first query will be slow while the ONNX runtime spins up.
+
+    Also includes `failed_chunk_ids: list[str]` — the IDs of up to 50
+    chunks currently in `failed_chunks`, most-recent first. If
+    `total_failed_chunks > 50`, the list is truncated and the final
+    entry is suffixed with ' (truncated)'.
+    """
     if not HAVE_SEMANTIC:
         return _missing()
+    # Snapshot warmth BEFORE get_state() runs init() so the very first
+    # call reports embedder_warm=False (matches the documented contract
+    # — "first query will be slow").
+    warm = _state is not None
     state = get_state()
     s = store_index_status(state.conn)
     # Pull the active EP from the session for transparency.
@@ -375,17 +444,23 @@ def semantic_index_status() -> dict[str, Any]:
             providers = list(sess.get_providers())
     except Exception:
         providers = []
+    failed_ids = list_failed_chunk_ids(state.conn, limit=50)
+    if s.total_failed_chunks > 50 and failed_ids:
+        failed_ids = list(failed_ids)
+        failed_ids[-1] = failed_ids[-1] + " (truncated)"
     return {
         "schema_version": s.schema_version,
         "total_nodes": s.total_nodes,
         "total_chunks": s.total_chunks,
         "total_failed_chunks": s.total_failed_chunks,
+        "failed_chunk_ids": failed_ids,
         "chunks_vec_dim": s.chunks_vec_dim,
         "last_indexed_at": s.last_indexed_at,
         "vec_version": s.vec_version,
         "embedder_provider": state.embedder.provider_name(),
         "embedder_model": state.embedder.model_identifier(),
         "embedder_dim": state.embedder.dimensions(),
+        "embedder_warm": warm,
         "onnx_providers": providers,
         "data_dir": str(state.config.data_dir),
         "db_path": str(state.config.db_path),

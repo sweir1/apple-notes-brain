@@ -520,6 +520,7 @@ class ChunkHit:
     end_line: int | None
     note_title: str
     score: float
+    note_folder: str | None = None
 
 
 def search_chunk_vectors(
@@ -539,7 +540,7 @@ def search_chunk_vectors(
         SELECT v.rowid, v.distance,
                c.id, c.node_id, c.chunk_index, c.heading, c.heading_level,
                c.content, c.start_line, c.end_line,
-               n.title
+               n.title, n.folder
         FROM chunks_vec v
         JOIN chunks c ON c.rowid = v.rowid
         JOIN nodes  n ON n.id    = c.node_id
@@ -560,6 +561,7 @@ def search_chunk_vectors(
             end_line=r[9],
             note_title=r[10],
             score=1.0 - float(r[1]),
+            note_folder=r[11],
         )
         for r in rows
     ]
@@ -615,6 +617,36 @@ def record_failed_chunk(
 
 def count_failed_chunks(conn: sqlite3.Connection) -> int:
     return int(conn.execute("SELECT COUNT(*) FROM failed_chunks").fetchone()[0])
+
+
+def clear_failed_chunks(conn: sqlite3.Connection) -> int:
+    """Delete every row from failed_chunks. Returns the row count
+    deleted. Used by `reindex_semantic(force=True)` to reset the
+    persistent failure counter that otherwise sticks around even after
+    the original failure has been resolved by a subsequent successful
+    pass."""
+    count = count_failed_chunks(conn)
+    conn.execute("DELETE FROM failed_chunks")
+    return count
+
+
+def list_failed_chunk_ids(
+    conn: sqlite3.Connection, *, limit: int = 50
+) -> list[str]:
+    """Return up to `limit` failed chunk IDs, most-recent first.
+
+    Used by `semantic_index_status` to surface which chunks are
+    currently failing so the caller can correlate with the
+    `total_failed_chunks` counter.
+    """
+    if limit <= 0:
+        return []
+    rows = conn.execute(
+        "SELECT chunk_id FROM failed_chunks "
+        "ORDER BY failed_at DESC, chunk_id ASC LIMIT ?",
+        (int(limit),),
+    ).fetchall()
+    return [str(r[0]) for r in rows]
 
 
 # ---------------------------------------------------------------------------
