@@ -28,6 +28,7 @@ import numpy as np
 from ..config import SemanticConfig
 from ..types import (
     EmbedderDeadError,
+    EmbedderMetadata,
     ModelDownloadError,
     ModelLoadError,
     TooLongError,
@@ -63,6 +64,10 @@ class OnnxEmbedder:
         self._providers: tuple[str, ...] = self._default_providers()
         self._max_tokens = _DEFAULT_MAX_TOKENS
         self._disposed = False
+        # Resolved per-model metadata — attached post-init() by the
+        # metadata-resolver chain. None means "no prefixes applied; assume
+        # a symmetric model" (the original v1.1.0 behaviour).
+        self._metadata: EmbedderMetadata | None = None
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -219,17 +224,41 @@ class OnnxEmbedder:
                 "OnnxEmbedder.embed() called before init(); call init() first."
             )
         # task_type is folded into prefix injection for asymmetric models;
-        # for symmetric models (BGE-small, MiniLM) it's a no-op. We don't
-        # currently have per-model prefix metadata so we accept the input
-        # text verbatim. (Future work: wire metadata-resolver.)
+        # for symmetric models (BGE-small, MiniLM) the resolved metadata
+        # carries empty strings for both prefixes so this is a no-op.
+        # When metadata hasn't been attached yet we treat that as
+        # symmetric — preserves the pre-Phase-δ behaviour on the initial
+        # boot pass before the resolver fires.
+        prefixed = self._apply_prefix(text, task_type)
         try:
-            return self._run_session_pooled(text)
+            return self._run_session_pooled(prefixed)
         except TooLongError:
             raise
         except Exception as exc:
             raise EmbedderDeadError(
                 f"OnnxEmbedder.embed() failed: {exc}"
             ) from exc
+
+    def set_metadata(self, meta: EmbedderMetadata) -> None:
+        """Attach resolved metadata. Idempotent — last call wins."""
+        self._metadata = meta
+
+    def _apply_prefix(
+        self, text: str, task_type: Literal["document", "query"] | None
+    ) -> str:
+        """Prepend the query / document prefix from resolved metadata.
+
+        ``task_type='query'`` → query_prefix; ``'document'`` or ``None`` →
+        document_prefix. An empty-string prefix is a no-op (returns
+        ``text`` unchanged). No metadata at all is also a no-op.
+        """
+        meta = self._metadata
+        if meta is None:
+            return text
+        prefix = meta.query_prefix if task_type == "query" else meta.document_prefix
+        if not prefix:
+            return text
+        return prefix + text
 
     def dimensions(self) -> int:
         if self._dim is None:

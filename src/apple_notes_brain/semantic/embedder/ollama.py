@@ -19,7 +19,7 @@ from typing import Any, Literal
 import numpy as np
 
 from ..config import SemanticConfig, DEFAULT_OLLAMA_NUM_CTX_FALLBACK
-from ..types import EmbedderDeadError, TooLongError
+from ..types import EmbedderDeadError, EmbedderMetadata, TooLongError
 from .presets import DEFAULT_PRESET, resolve_preset
 
 _log = logging.getLogger("apple-notes-brain")
@@ -38,6 +38,9 @@ class OllamaEmbedder:
         self._cached_num_ctx: int | None = None
         self._client: Any | None = None
         self._disposed = False
+        # Resolved metadata — attached post-init() by the metadata resolver.
+        # None means "no prefixes; assume symmetric model".
+        self._metadata: EmbedderMetadata | None = None
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -94,14 +97,35 @@ class OllamaEmbedder:
                 f"OllamaEmbedder: input ~{approx_tokens} tokens exceeds 2x "
                 f"effective num_ctx {self._effective_num_ctx()}"
             )
+        prefixed = self._apply_prefix(text, task_type)
         try:
-            return self._embed_via_http(text)
+            return self._embed_via_http(prefixed)
         except TooLongError:
             raise
         except Exception as exc:
             raise EmbedderDeadError(
                 f"OllamaEmbedder.embed() failed: {exc}"
             ) from exc
+
+    def set_metadata(self, meta: EmbedderMetadata) -> None:
+        """Attach resolved metadata. Idempotent — last call wins."""
+        self._metadata = meta
+
+    def _apply_prefix(
+        self, text: str, task_type: Literal["document", "query"] | None
+    ) -> str:
+        """Prepend the query / document prefix from resolved metadata.
+
+        Symmetric models (empty prefixes) and pre-resolver state (no
+        metadata attached) are no-ops; the input is returned unchanged.
+        """
+        meta = self._metadata
+        if meta is None:
+            return text
+        prefix = meta.query_prefix if task_type == "query" else meta.document_prefix
+        if not prefix:
+            return text
+        return prefix + text
 
     def dimensions(self) -> int:
         if self._dim is None:

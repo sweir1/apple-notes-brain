@@ -108,6 +108,16 @@ class Embedder(Protocol):
     def dispose(self) -> None:
         """Release resources. Idempotent."""
 
+    def set_metadata(self, meta: "EmbedderMetadata") -> None:
+        """Attach resolved metadata so embed() can apply per-task prefixes.
+
+        Idempotent — safe to call multiple times. Replaces any previously
+        attached metadata. The asymmetric prefixes are read from the
+        passed-in record on every embed() call (no caching), so future
+        re-resolution after a prefix-strategy change just needs another
+        set_metadata() — no embedder restart required.
+        """
+
 
 # ---------------------------------------------------------------------------
 # Embedder metadata — resolved once at init; cached in embedder_capability
