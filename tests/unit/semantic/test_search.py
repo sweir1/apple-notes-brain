@@ -205,3 +205,55 @@ def test_hybrid_dedup_by_note(search_setup):
     out = search.hybrid("a", limit=10)
     note_ids = [r.note_id for r in out]
     assert len(note_ids) == len(set(note_ids))
+
+
+# ---------------------------------------------------------------------------
+# Score disambiguation (Fix #2 — v1.1)
+# ---------------------------------------------------------------------------
+
+def test_hybrid_fused_score_always_set(search_setup):
+    search, _, _ = search_setup
+    out = search.hybrid("pasta", limit=5)
+    for r in out:
+        assert r.fused_score is not None
+
+
+def test_hybrid_semantic_score_when_present_is_cosine(search_setup):
+    """semantic_score values are cosine similarities, hence bounded by
+    [-1, 1] (and for our normalised vectors, always between 0 and 1)."""
+    search, _, _ = search_setup
+    out = search.hybrid("pasta", limit=5)
+    for r in out:
+        if r.semantic_score is not None:
+            assert -1.0 <= r.semantic_score <= 1.0
+
+
+def test_hybrid_score_equals_fused_score(search_setup):
+    """The .score field is preserved as a mirror of fused_score for
+    legacy sort-by-score consumers."""
+    search, _, _ = search_setup
+    out = search.hybrid("pasta", limit=5)
+    for r in out:
+        assert r.score == r.fused_score
+
+
+def test_pure_semantic_chunks_have_none_fused_score(search_setup):
+    """Pure semantic results never set fused_score — RRF didn't run."""
+    search, _, _ = search_setup
+    out = search.semantic_chunks("pasta", limit=5)
+    for r in out:
+        assert r.fused_score is None
+
+
+def test_pure_semantic_chunks_have_none_lexical_score(search_setup):
+    search, _, _ = search_setup
+    out = search.semantic_chunks("pasta", limit=5)
+    for r in out:
+        assert r.lexical_score is None
+
+
+def test_hybrid_response_sorted_by_fused_score_desc(search_setup):
+    search, _, _ = search_setup
+    out = search.hybrid("pasta night quick", limit=10)
+    fused = [r.fused_score for r in out]
+    assert fused == sorted(fused, reverse=True)

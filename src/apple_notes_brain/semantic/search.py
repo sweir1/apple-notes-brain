@@ -26,6 +26,25 @@ from .types import (
     SearchUnique,
 )
 
+# Folder names treated as trash for the query-time defence-in-depth
+# filter. Apple's English-locale localised name is the only one we
+# can identify without joining NoteStore.sqlite at query time (which
+# we deliberately don't do — Search runs against the semantic store
+# only). Non-English locales remain on the index-time filter path.
+_TRASH_FOLDER_NAMES: frozenset[str] = frozenset({"Recently Deleted"})
+
+
+def _is_trash_folder(folder: str | None) -> bool:
+    """Return True iff the folder name matches a known trash folder.
+
+    None / empty strings are treated as live (a note with no folder
+    isn't in trash). Heuristic-only; the source-level filter is the
+    primary line of defence.
+    """
+    if not folder:
+        return False
+    return folder in _TRASH_FOLDER_NAMES
+
 
 # ---------------------------------------------------------------------------
 # RRF — standalone for testability
@@ -78,28 +97,60 @@ class Search:
 
     # -- Semantic -------------------------------------------------------
 
-    def semantic(self, query: str, limit: int = 20) -> list[SearchResult]:
+    def semantic(
+        self, query: str, limit: int = 20, *, include_trash: bool = False
+    ) -> list[SearchResult]:
         """Note-level semantic search. Dedups multi-chunk hits per note,
         keeping the best-scoring chunk for each."""
-        chunks = self.semantic_chunks(query, limit=limit, unique="notes")
+        chunks = self.semantic_chunks(
+            query, limit=limit, unique="notes", include_trash=include_trash
+        )
         # ChunkAwareResult already has note-level fields populated.
-        return [SearchResult(r.note_id, r.title, r.score, r.excerpt) for r in chunks]
+        return [
+            SearchResult(
+                note_id=r.note_id, title=r.title, score=r.score,
+                excerpt=r.excerpt, folder=r.folder,
+            )
+            for r in chunks
+        ]
 
     def semantic_chunks(
-        self, query: str, limit: int = 20, unique: SearchUnique = "notes"
+        self,
+        query: str,
+        limit: int = 20,
+        unique: SearchUnique = "notes",
+        *,
+        include_trash: bool = False,
     ) -> list[ChunkAwareResult]:
         """Chunk-grained semantic search.
 
         When unique='notes', results are deduplicated to one per note
         (the highest-scoring chunk wins). When unique='chunks', every
         matched chunk is its own result row.
+
+        `include_trash=False` (the default) is a defence-in-depth filter
+        that drops any kNN hit whose `note_folder` is recognised as a
+        trash folder. The primary defence is in the indexer (trash notes
+        never get embedded). This filter is here so a stale index that
+        still contains a trash-folder hit doesn't leak it to callers.
         """
         if not query or not query.strip():
             return []
         vec = self._embedder.embed(query, task_type="query")
-        # Over-fetch to leave headroom for dedup.
-        raw_limit = limit * 4 if unique == "notes" else limit
+        # Over-fetch to leave headroom for dedup + trash filtering.
+        # Trash hits will be silently dropped, so we pad by a constant
+        # to keep the post-filter result count near the requested limit.
+        trash_overhead = 0 if include_trash else 16
+        if unique == "notes":
+            raw_limit = limit * 4 + trash_overhead
+        else:
+            raw_limit = limit + trash_overhead
         hits = search_chunk_vectors(self._conn, vec, raw_limit)
+        if not hits:
+            return []
+        # Defence-in-depth: filter trash-folder hits at query time.
+        if not include_trash:
+            hits = [h for h in hits if not _is_trash_folder(h.note_folder)]
         if not hits:
             return []
         results: list[ChunkAwareResult] = []
@@ -111,6 +162,7 @@ class Search:
                         title=h.note_title,
                         score=h.score,
                         excerpt=h.content[:200],
+                        folder=h.note_folder,
                         chunk_id=h.chunk_id,
                         chunk_heading=h.heading,
                         chunk_start_line=h.start_line,
@@ -128,6 +180,7 @@ class Search:
                 title=h.note_title,
                 score=h.score,
                 excerpt=h.content[:200],
+                folder=h.note_folder,
                 chunk_id=h.chunk_id,
                 chunk_heading=h.heading,
                 chunk_start_line=h.start_line,
@@ -144,14 +197,28 @@ class Search:
 
     # -- Fulltext -------------------------------------------------------
 
-    def fulltext(self, query: str, limit: int = 20) -> list[SearchResult]:
-        """BM25 search over `nodes_fts`. Returns note-level hits."""
+    def fulltext(
+        self, query: str, limit: int = 20, *, include_trash: bool = False
+    ) -> list[SearchResult]:
+        """BM25 search over `nodes_fts`. Returns note-level hits.
+
+        `include_trash=False` drops fulltext hits whose folder is a
+        recognised trash folder — same defence-in-depth as the semantic
+        path.
+        """
         if not query or not query.strip():
             return []
-        rows = search_full_text(self._conn, query, limit=limit)
+        # Over-fetch when trash-filtering so a fully-stale index doesn't
+        # collapse to an empty result list.
+        trash_overhead = 0 if include_trash else 16
+        rows = search_full_text(self._conn, query, limit=limit + trash_overhead)
+        if not include_trash:
+            rows = [r for r in rows if not _is_trash_folder(r.folder)]
+        rows = rows[:limit]
         return [
             SearchResult(
-                note_id=r.node_id, title=r.title, score=r.score, excerpt=r.excerpt
+                note_id=r.node_id, title=r.title, score=r.score,
+                excerpt=r.excerpt, folder=r.folder,
             )
             for r in rows
         ]
@@ -159,20 +226,36 @@ class Search:
     # -- Hybrid (RRF) ---------------------------------------------------
 
     def hybrid(
-        self, query: str, limit: int = 20, unique: SearchUnique = "notes",
+        self,
+        query: str,
+        limit: int = 20,
+        unique: SearchUnique = "notes",
+        *,
+        include_trash: bool = False,
     ) -> list[ChunkAwareResult]:
         """Reciprocal-rank-fused semantic + fulltext results.
 
         Both sub-queries over-fetch by 4x so RRF has signal to work with
-        even when one source has very few hits. Per-source score is
-        retained on the returned record (semantic_score / lexical_score)
-        so the UI can show provenance.
+        even when one source has very few hits.
+
+        Score-field semantics (post v1.1 fix):
+          * `semantic_score` = raw cosine similarity from the kNN ranker,
+            or None if this doc only matched via fulltext.
+          * `lexical_score` = negated-BM25 from the fulltext ranker,
+            or None if this doc only matched via the kNN ranker.
+          * `fused_score` = the RRF sum (the value used for ranking).
+          * `score` = `fused_score` (so existing sort-by-score callers
+            still see the fused ordering).
         """
         if not query or not query.strip():
             return []
         overfetch = max(limit * 4, 20)
-        semantic_hits = self.semantic_chunks(query, limit=overfetch, unique="chunks")
-        fulltext_hits = self.fulltext(query, limit=overfetch)
+        semantic_hits = self.semantic_chunks(
+            query, limit=overfetch, unique="chunks", include_trash=include_trash,
+        )
+        fulltext_hits = self.fulltext(
+            query, limit=overfetch, include_trash=include_trash
+        )
         # Build a note-id keyed map of semantic + fulltext scores so we
         # can stamp both onto the merged record.
         sem_score_by_note: dict[str, ChunkAwareResult] = {}
@@ -197,7 +280,7 @@ class Search:
                 # the semantic list (if any) so RRF can fuse on chunk_id.
                 ChunkAwareResult(
                     note_id=lex.note_id, title=lex.title, score=lex.score,
-                    excerpt=lex.excerpt,
+                    excerpt=lex.excerpt, folder=lex.folder,
                     chunk_id=(
                         sem_score_by_note[lex.note_id].chunk_id
                         if lex.note_id in sem_score_by_note else None
@@ -222,7 +305,7 @@ class Search:
             lex_proj = [
                 ChunkAwareResult(
                     note_id=h.note_id, title=h.title, score=h.score,
-                    excerpt=h.excerpt,
+                    excerpt=h.excerpt, folder=h.folder,
                     chunk_id=None, chunk_heading=None,
                     chunk_start_line=None, chunk_end_line=None,
                     chunk_excerpt=h.excerpt,
@@ -242,9 +325,14 @@ class Search:
             if key in seen_keys:
                 continue
             seen_keys.add(key)
-            # Stamp the RRF score AND the per-source scores so the UI
-            # can render provenance ("matched semantically + lexically").
-            r.score = scored.score
+            # Strict score-provenance semantics:
+            #   semantic_score := raw cosine from semantic ranker (None
+            #     if this doc didn't appear in the semantic results).
+            #   lexical_score  := negated-BM25 from fulltext ranker
+            #     (None if this doc didn't appear in the fulltext results).
+            #   fused_score    := RRF sum (always set for hybrid output).
+            #   score          := fused_score (preserved as the ordering
+            #     key so existing `sort by -r.score` consumers Just Work).
             r.semantic_score = (
                 sem_score_by_note[r.note_id].score
                 if r.note_id in sem_score_by_note else None
@@ -253,7 +341,14 @@ class Search:
                 lex_score_by_note[r.note_id].score
                 if r.note_id in lex_score_by_note else None
             )
+            r.fused_score = scored.score
+            r.score = scored.score
             out.append(r)
             if len(out) >= limit:
                 break
+        # Defensive resort by fused_score descending — the RRF helper
+        # already returns its output sorted, but downstream readers
+        # shouldn't rely on iteration order matching RRF order if the
+        # underlying merge ever changes.
+        out.sort(key=lambda r: -(r.fused_score or r.score))
         return out

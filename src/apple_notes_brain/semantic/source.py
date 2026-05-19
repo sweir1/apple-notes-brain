@@ -39,10 +39,16 @@ class NoteRecord:
 class NotesSource(Protocol):
     """The contract the indexer reads against."""
 
-    def iter_notes(self) -> Iterator[NoteRecord]:
+    def iter_notes(self, include_trash: bool = False) -> Iterator[NoteRecord]:
         """Yield every indexable note exactly once. Order doesn't matter
         for correctness; sorting by modified_at descending is nice for
-        responsive incremental indexing UIs."""
+        responsive incremental indexing UIs.
+
+        `include_trash=False` (the default) excludes notes living in a
+        trash folder (Apple's 'Recently Deleted'). Trash notes are still
+        skipped for the row-level `ZMARKEDFORDELETION` flag too — both
+        filters apply.
+        """
 
     def body_text(self, record: NoteRecord) -> str:
         """Return the plaintext body for a record. Empty string for
@@ -71,19 +77,49 @@ class AppleNotesSource:
         # a FakeNotesSource never has to pay sqlite_reader's import cost.
         pass
 
-    def iter_notes(self) -> Iterator[NoteRecord]:
+    def iter_notes(self, include_trash: bool = False) -> Iterator[NoteRecord]:
         from apple_notes_brain import sqlite_reader as sr
 
         with sr._open() as conn:  # type: ignore[attr-defined]
-            yield from self._iter_from_conn(conn)
+            yield from self._iter_from_conn(conn, include_trash=include_trash)
 
-    def _iter_from_conn(self, conn: sqlite3.Connection) -> Iterator[NoteRecord]:
-        """Run the listing query against an already-open connection."""
+    def _iter_from_conn(
+        self, conn: sqlite3.Connection, *, include_trash: bool = False
+    ) -> Iterator[NoteRecord]:
+        """Run the listing query against an already-open connection.
+
+        When `include_trash` is False (the default), notes whose ZFOLDER
+        points at any folder Z_PK in `sqlite_reader.trash_folder_pks()`
+        are excluded. The row-level `ZMARKEDFORDELETION` filter applies
+        regardless — a note can be marked-for-deletion while still being
+        in a live folder during an iCloud reconciliation window, and we
+        always want to skip those too.
+        """
         # Note rows are Z_ENT=12 with a title; the column names we need.
         # ZACCOUNT8 isn't on every macOS — but for listing it doesn't matter,
         # we just don't surface the account here.
+        trash_pks: set[int] = set()
+        if not include_trash:
+            from apple_notes_brain import sqlite_reader as sr
+
+            try:
+                trash_pks = sr.trash_folder_pks()
+            except Exception:
+                # If we can't determine trash folders (e.g. ZFOLDERTYPE
+                # absent on a really old schema), fall back to no filter
+                # rather than mis-excluding everything.
+                trash_pks = set()
+        where_extra = ""
+        params: list[int] = []
+        if trash_pks:
+            placeholders = ",".join("?" * len(trash_pks))
+            where_extra = (
+                f" AND (ZICCLOUDSYNCINGOBJECT.ZFOLDER IS NULL "
+                f"OR ZICCLOUDSYNCINGOBJECT.ZFOLDER NOT IN ({placeholders}))"
+            )
+            params.extend(trash_pks)
         rows = conn.execute(
-            """
+            f"""
             SELECT
                 ZICCLOUDSYNCINGOBJECT.ZIDENTIFIER,
                 ZICCLOUDSYNCINGOBJECT.Z_PK,
@@ -99,8 +135,10 @@ class AppleNotesSource:
             WHERE ZICCLOUDSYNCINGOBJECT.ZTITLE1 IS NOT NULL
               AND COALESCE(ZICCLOUDSYNCINGOBJECT.ZMARKEDFORDELETION, 0) = 0
               AND ZICCLOUDSYNCINGOBJECT.ZIDENTIFIER IS NOT NULL
+              {where_extra}
             ORDER BY ZICCLOUDSYNCINGOBJECT.ZMODIFICATIONDATE1 DESC
-            """
+            """,
+            params,
         )
         for r in rows:
             yield NoteRecord(
@@ -176,12 +214,25 @@ def _coredata_to_unix(value) -> int:
 
 class FakeNotesSource:
     """Pure-memory source for unit tests. Construct with a dict of
-    {z_identifier: (record, body_text)}."""
+    {z_identifier: (record, body_text)}.
+
+    Notes whose `folder` matches one of `trash_folder_names` are treated
+    as trashed and skipped by `iter_notes(include_trash=False)`. Defaults
+    to {'Recently Deleted'} to mirror Apple's English-locale convention.
+    """
 
     def __init__(
-        self, notes: dict[str, tuple[NoteRecord, str]] | None = None
+        self,
+        notes: dict[str, tuple[NoteRecord, str]] | None = None,
+        *,
+        trash_folder_names: set[str] | None = None,
     ) -> None:
         self._notes: dict[str, tuple[NoteRecord, str]] = dict(notes or {})
+        self._trash_folder_names: set[str] = (
+            set(trash_folder_names)
+            if trash_folder_names is not None
+            else {"Recently Deleted"}
+        )
 
     def add(self, record: NoteRecord, body: str) -> None:
         self._notes[record.z_identifier] = (record, body)
@@ -189,7 +240,7 @@ class FakeNotesSource:
     def remove(self, z_identifier: str) -> None:
         self._notes.pop(z_identifier, None)
 
-    def iter_notes(self) -> Iterator[NoteRecord]:
+    def iter_notes(self, include_trash: bool = False) -> Iterator[NoteRecord]:
         # Sort by modified_at desc to match real-world ordering, gives
         # deterministic test output.
         records = sorted(
@@ -198,6 +249,8 @@ class FakeNotesSource:
             reverse=True,
         )
         for r in records:
+            if not include_trash and r.folder in self._trash_folder_names:
+                continue
             yield r
 
     def body_text(self, record: NoteRecord) -> str:

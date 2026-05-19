@@ -46,6 +46,7 @@ class FullTextHit:
     title: str
     score: float          # higher = better (we negate BM25 internally)
     excerpt: str = ""     # `>>>match<<<` markers around the matched span
+    folder: str | None = None
 
 
 def search_full_text(
@@ -67,7 +68,8 @@ def search_full_text(
                 n.id,
                 n.title,
                 bm25(nodes_fts, 5.0, 1.0) AS bm25_score,
-                snippet(nodes_fts, 1, '>>>', '<<<', '...', 40) AS excerpt
+                snippet(nodes_fts, 1, '>>>', '<<<', '...', 40) AS excerpt,
+                n.folder
             FROM nodes_fts
             JOIN nodes n ON n.rowid = nodes_fts.rowid
             WHERE nodes_fts MATCH ?
@@ -91,6 +93,7 @@ def search_full_text(
             # rest of the codebase where higher-is-better.
             score=-float(r[2]),
             excerpt=str(r[3] or ""),
+            folder=(str(r[4]) if len(r) > 4 and r[4] is not None else None),
         )
         for r in rows
     ]

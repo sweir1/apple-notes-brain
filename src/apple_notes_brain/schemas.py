@@ -37,8 +37,16 @@ class NoteSummary(BaseModel):
     shared: bool = False  # CloudKit shared note — owner can edit/delete; read-only participants silently fail
 
     # Semantic / hybrid search additions (v1.1). All None for lexical paths.
-    semantic_score: float | None = None  # cosine similarity (higher better)
-    lexical_score: float | None = None   # negated BM25 (higher better)
+    semantic_score: float | None = None  # raw cosine similarity from the
+                                         # semantic ranker; None when the
+                                         # hit only matched via fulltext.
+    lexical_score: float | None = None   # negated BM25 from the fulltext
+                                         # ranker; None when the hit only
+                                         # matched via the semantic ranker.
+    fused_score: float | None = None     # RRF combined score for hybrid
+                                         # results; None for pure-semantic
+                                         # / pure-lexical paths. Higher
+                                         # is better.
     chunk_excerpt: str | None = None     # ~200 chars from the matched chunk
     chunk_heading: str | None = None     # heading of the matched chunk
 

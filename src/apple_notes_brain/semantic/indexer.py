@@ -101,18 +101,25 @@ class IndexPipeline:
     # Full-pass index
     # ------------------------------------------------------------------
 
-    def index_all(self, source: NotesSource) -> IndexStats:
+    def index_all(
+        self, source: NotesSource, *, include_trash: bool = False
+    ) -> IndexStats:
         """Walk every note from the source, embedding dirty chunks.
 
         Notes present in the index but absent from the source are
-        deleted (cascade removes chunks + vec rows).
+        deleted (cascade removes chunks + vec rows). The default
+        `include_trash=False` filters trashed notes at the source —
+        the tombstone sweep below then naturally cleans any
+        previously-indexed notes that have since been trashed (they
+        stop appearing in `iter_notes()` so they're treated like any
+        other deleted note).
         """
         self.prepare()
         start_ms = int(time.time() * 1000)
         stats = IndexStats()
         seen_zids: set[str] = set()
 
-        for record in source.iter_notes():
+        for record in source.iter_notes(include_trash=include_trash):
             stats.notes_seen += 1
             seen_zids.add(record.z_identifier)
             try:

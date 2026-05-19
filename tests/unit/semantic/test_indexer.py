@@ -342,3 +342,114 @@ def test_index_single_change_re_embeds(pipeline, conn, emb):
     src.add(_rec("zid-1"), "Brand new body content longer than min.")
     pipeline.index_single(src, "zid-1", event="change")
     assert emb.embed_count > before
+
+
+# ---------------------------------------------------------------------------
+# Trash exclusion (Fix #1 — v1.1)
+# ---------------------------------------------------------------------------
+
+def _trash_rec(zid: str, title: str = "T", body: str = "") -> NoteRecord:
+    """A NoteRecord whose folder is the canonical English trash name."""
+    return NoteRecord(
+        z_identifier=zid, z_pk=1, title=title,
+        folder="Recently Deleted", modified_at=1700000000,
+        locked=False, pinned=False,
+    )
+
+
+def test_index_all_excludes_trash_by_default(pipeline, conn):
+    """A note whose folder is 'Recently Deleted' is silently dropped."""
+    src = FakeNotesSource()
+    src.add(_rec("zid-1"), "Live body content here long enough to chunk.")
+    src.add(_trash_rec("zid-2"), "Trash body content here long enough to chunk.")
+    stats = pipeline.index_all(src)
+    assert stats.notes_seen == 1  # FakeNotesSource skips the trash record
+    assert all_node_ids(conn) == {"zid-1"}
+    assert get_node(conn, "zid-2") is None
+
+
+def test_index_all_include_trash_true_indexes_trash(pipeline, conn):
+    src = FakeNotesSource()
+    src.add(_rec("zid-1"), "Live body content here long enough to chunk.")
+    src.add(_trash_rec("zid-2"), "Trash body content here long enough to chunk.")
+    stats = pipeline.index_all(src, include_trash=True)
+    assert stats.notes_seen == 2
+    assert all_node_ids(conn) == {"zid-1", "zid-2"}
+
+
+def test_trashing_previously_indexed_note_triggers_tombstone(pipeline, conn):
+    """End-to-end: a note indexed live, then moved to trash, gets
+    tombstone-deleted from the index on the next pass."""
+    src = FakeNotesSource()
+    # Initial pass with the note in a live folder.
+    live = _rec("zid-99", title="ShockSpec")
+    src.add(live, "suspension shocks coilovers body content longer than min.")
+    pipeline.index_all(src)
+    assert get_node(conn, "zid-99") is not None
+
+    # Simulate user moving the note to Recently Deleted.
+    src.add(_trash_rec("zid-99", title="ShockSpec"),
+            "suspension shocks coilovers body content longer than min.")
+    stats = pipeline.index_all(src)
+    # Tombstone sweep should have removed it.
+    assert stats.notes_deleted == 1
+    assert get_node(conn, "zid-99") is None
+
+
+def test_only_trash_source_yields_empty_pass(pipeline, conn):
+    src = FakeNotesSource()
+    src.add(_trash_rec("zid-1"), "Body 1 here long enough to chunk.")
+    src.add(_trash_rec("zid-2"), "Body 2 here long enough to chunk.")
+    stats = pipeline.index_all(src)
+    assert stats.notes_seen == 0
+    assert all_node_ids(conn) == set()
+
+
+def test_index_all_seen_count_excludes_trash(pipeline):
+    """The reported `notes_seen` reflects what was actually iterated,
+    not the underlying corpus size."""
+    src = FakeNotesSource()
+    for i in range(5):
+        src.add(_rec(f"zid-{i}"), f"Body {i} content longer than min.")
+    for i in range(5, 8):
+        src.add(_trash_rec(f"zid-{i}"), f"Trash {i} body longer than min.")
+    stats = pipeline.index_all(src)
+    assert stats.notes_seen == 5
+
+
+def test_trash_filter_handles_custom_trash_names(pipeline, conn):
+    """FakeNotesSource accepts a custom trash-folder-name set for tests
+    that simulate non-English-locale users."""
+    src = FakeNotesSource(trash_folder_names={"Papelera"})
+    rec = NoteRecord(
+        z_identifier="zid-1", z_pk=1, title="T", folder="Papelera",
+        modified_at=1700000000, locked=False, pinned=False,
+    )
+    src.add(rec, "Trash body content here longer than min.")
+    pipeline.index_all(src)
+    assert get_node(conn, "zid-1") is None
+
+
+def test_trash_filter_does_not_drop_notes_without_folder(pipeline, conn):
+    """A note with folder=None is treated as live (no folder ≠ trash)."""
+    src = FakeNotesSource()
+    rec = NoteRecord(
+        z_identifier="zid-1", z_pk=1, title="T", folder=None,
+        modified_at=1700000000, locked=False, pinned=False,
+    )
+    src.add(rec, "Body content here longer than min.")
+    pipeline.index_all(src)
+    assert get_node(conn, "zid-1") is not None
+
+
+def test_index_all_with_include_trash_then_default_sweeps(pipeline, conn):
+    """Index once with include_trash=True; subsequent default pass
+    sweeps trash-folder nodes via the tombstone path."""
+    src = FakeNotesSource()
+    src.add(_rec("zid-1"), "Live body content here longer than min.")
+    src.add(_trash_rec("zid-2"), "Trash body content here longer than min.")
+    pipeline.index_all(src, include_trash=True)
+    assert get_node(conn, "zid-2") is not None
+    stats = pipeline.index_all(src)  # default include_trash=False
+    assert stats.notes_deleted == 1
+    assert get_node(conn, "zid-2") is None
