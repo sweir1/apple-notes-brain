@@ -42,6 +42,31 @@ def _meta(pk: int, *, folder_pk: int = 1, locked: bool = False, title: str = "T"
     }
 
 
+def _empty_breakdown() -> dict:
+    """An attachment_breakdown() return-value shape with all buckets at 0."""
+    return {
+        b: {
+            "count": 0,
+            "destructive": b != "table",
+            "utis": [],
+            "filenames": [],
+        }
+        for b in ("image", "sketch", "scan", "audio", "file", "table")
+    }
+
+
+def _breakdown_with_destructive(n_images: int = 0, n_tables: int = 0) -> dict:
+    """An attachment_breakdown() return value with N images and/or N tables."""
+    out = _empty_breakdown()
+    if n_images:
+        out["image"]["count"] = n_images
+        out["image"]["utis"] = ["public.jpeg"]
+    if n_tables:
+        out["table"]["count"] = n_tables
+        out["table"]["utis"] = ["com.apple.notes.table"]
+    return out
+
+
 # Common stack of "make AppleScript inert and DB writes harmless" patches
 def _common_write_patches(
     *,
@@ -332,6 +357,8 @@ class TestUpdateNote:
              patch("apple_notes_brain.sqlite_reader.note_meta", return_value=_meta(100)), \
              patch("apple_notes_brain.sqlite_reader.trash_folder_pks", return_value={2}), \
              patch("apple_notes_brain.sqlite_reader.attachment_count", return_value=0), \
+             patch("apple_notes_brain.sqlite_reader.attachment_breakdown",
+                   return_value=_empty_breakdown()), \
              patch("apple_notes_brain.sqlite_reader.short_id", return_value="p100"):
             _enter_all(patches)
             try:
@@ -353,6 +380,8 @@ class TestUpdateNote:
              patch("apple_notes_brain.sqlite_reader.note_meta", return_value=_meta(100)), \
              patch("apple_notes_brain.sqlite_reader.trash_folder_pks", return_value={2}), \
              patch("apple_notes_brain.sqlite_reader.attachment_count", return_value=0), \
+             patch("apple_notes_brain.sqlite_reader.attachment_breakdown",
+                   return_value=_empty_breakdown()), \
              patch("apple_notes_brain.sqlite_reader.short_id", return_value="p100"):
             _enter_all(patches)
             try:
@@ -373,6 +402,8 @@ class TestUpdateNote:
              patch("apple_notes_brain.sqlite_reader.note_meta", return_value=_meta(100)), \
              patch("apple_notes_brain.sqlite_reader.trash_folder_pks", return_value={2}), \
              patch("apple_notes_brain.sqlite_reader.attachment_count", return_value=0), \
+             patch("apple_notes_brain.sqlite_reader.attachment_breakdown",
+                   return_value=_empty_breakdown()), \
              patch("apple_notes_brain.sqlite_reader.short_id", return_value="p100"):
             _enter_all(patches)
             try:
@@ -387,7 +418,9 @@ class TestUpdateNote:
              patch("apple_notes_brain.sqlite_reader.note_meta",
                    return_value=_meta(100, locked=True)), \
              patch("apple_notes_brain.sqlite_reader.trash_folder_pks", return_value={2}), \
-             patch("apple_notes_brain.sqlite_reader.attachment_count", return_value=0):
+             patch("apple_notes_brain.sqlite_reader.attachment_count", return_value=0), \
+             patch("apple_notes_brain.sqlite_reader.attachment_breakdown",
+                   return_value=_empty_breakdown()):
             _enter_all(patches)
             try:
                 with pytest.raises(ValueError, match="locked"):
@@ -400,7 +433,9 @@ class TestUpdateNote:
         with patch("apple_notes_brain.sqlite_reader.resolve_id", return_value=("note", 100)), \
              patch("apple_notes_brain.sqlite_reader.note_meta", return_value=_meta(100)), \
              patch("apple_notes_brain.sqlite_reader.trash_folder_pks", return_value={2}), \
-             patch("apple_notes_brain.sqlite_reader.attachment_count", return_value=3):
+             patch("apple_notes_brain.sqlite_reader.attachment_count", return_value=3), \
+             patch("apple_notes_brain.sqlite_reader.attachment_breakdown",
+                   return_value=_breakdown_with_destructive(n_images=3)):
             _enter_all(patches)
             try:
                 with pytest.raises(ValueError, match="attachment"):
@@ -420,7 +455,9 @@ class TestUpdateNote:
              patch("apple_notes_brain.sqlite_reader.note_meta",
                    return_value=_meta(100, locked=True)), \
              patch("apple_notes_brain.sqlite_reader.trash_folder_pks", return_value={2}), \
-             patch("apple_notes_brain.sqlite_reader.attachment_count", return_value=5):
+             patch("apple_notes_brain.sqlite_reader.attachment_count", return_value=5), \
+             patch("apple_notes_brain.sqlite_reader.attachment_breakdown",
+                   return_value=_breakdown_with_destructive(n_images=5)):
             _enter_all(patches)
             try:
                 with pytest.raises(ValueError) as exc_info:
@@ -439,7 +476,9 @@ class TestUpdateNote:
              patch("apple_notes_brain.sqlite_reader.note_meta",
                    return_value=_meta(100, locked=True)), \
              patch("apple_notes_brain.sqlite_reader.trash_folder_pks", return_value={2}), \
-             patch("apple_notes_brain.sqlite_reader.attachment_count", return_value=2):
+             patch("apple_notes_brain.sqlite_reader.attachment_count", return_value=2), \
+             patch("apple_notes_brain.sqlite_reader.attachment_breakdown",
+                   return_value=_breakdown_with_destructive(n_images=2)):
             _enter_all(patches)
             try:
                 with pytest.raises(ValueError, match="attachment"):
@@ -453,6 +492,8 @@ class TestUpdateNote:
              patch("apple_notes_brain.sqlite_reader.note_meta", return_value=_meta(100)), \
              patch("apple_notes_brain.sqlite_reader.trash_folder_pks", return_value={2}), \
              patch("apple_notes_brain.sqlite_reader.attachment_count", return_value=3), \
+             patch("apple_notes_brain.sqlite_reader.attachment_breakdown",
+                   return_value=_breakdown_with_destructive(n_images=3)), \
              patch("apple_notes_brain.sqlite_reader.short_id", return_value="p100"):
             _enter_all(patches)
             try:
@@ -461,13 +502,59 @@ class TestUpdateNote:
                 _stop_all(patches)
         assert out.action == "updated"
 
+    # v1.1 Part 4 Phase 3 — table-only notes can update without override.
+    def test_table_only_note_updates_without_attachment_loss_flag(self):
+        """A note with only a com.apple.notes.table attachment must
+        update freely — tables are CRDT widgets rebuilt from the new
+        HTML/markdown body, so the destructive_attachment_count is 0."""
+        patches = _common_write_patches()
+        with patch("apple_notes_brain.sqlite_reader.resolve_id", return_value=("note", 100)), \
+             patch("apple_notes_brain.sqlite_reader.note_meta", return_value=_meta(100)), \
+             patch("apple_notes_brain.sqlite_reader.trash_folder_pks", return_value={2}), \
+             patch("apple_notes_brain.sqlite_reader.attachment_count", return_value=1), \
+             patch("apple_notes_brain.sqlite_reader.attachment_breakdown",
+                   return_value=_breakdown_with_destructive(n_tables=1)), \
+             patch("apple_notes_brain.sqlite_reader.short_id", return_value="p100"):
+            _enter_all(patches)
+            try:
+                out = tools.update_note(note_id="p100", body="new body")
+            finally:
+                _stop_all(patches)
+        assert out.action == "updated"
+
+    def test_error_message_names_specific_buckets(self):
+        """When the guard refuses, the error must name the actual bucket
+        counts so the model knows what types are at risk."""
+        bd = _empty_breakdown()
+        bd["image"]["count"] = 2
+        bd["sketch"]["count"] = 1
+        patches = _common_write_patches()
+        with patch("apple_notes_brain.sqlite_reader.resolve_id", return_value=("note", 100)), \
+             patch("apple_notes_brain.sqlite_reader.note_meta", return_value=_meta(100)), \
+             patch("apple_notes_brain.sqlite_reader.trash_folder_pks", return_value={2}), \
+             patch("apple_notes_brain.sqlite_reader.attachment_count", return_value=3), \
+             patch("apple_notes_brain.sqlite_reader.attachment_breakdown", return_value=bd):
+            _enter_all(patches)
+            try:
+                with pytest.raises(ValueError) as exc_info:
+                    tools.update_note(note_id="p100", body="x")
+                msg = str(exc_info.value)
+                assert "image: 2" in msg
+                assert "sketch: 1" in msg
+                # The "tables don't count" reassurance is in the message.
+                assert "tables don't count" in msg.lower() or "table" in msg.lower()
+            finally:
+                _stop_all(patches)
+
     def test_in_recently_deleted_raises(self):
         patches = _common_write_patches()
         with patch("apple_notes_brain.sqlite_reader.resolve_id", return_value=("note", 100)), \
              patch("apple_notes_brain.sqlite_reader.note_meta",
                    return_value=_meta(100, folder_pk=2)), \
              patch("apple_notes_brain.sqlite_reader.trash_folder_pks", return_value={2}), \
-             patch("apple_notes_brain.sqlite_reader.attachment_count", return_value=0):
+             patch("apple_notes_brain.sqlite_reader.attachment_count", return_value=0), \
+             patch("apple_notes_brain.sqlite_reader.attachment_breakdown",
+                   return_value=_empty_breakdown()):
             _enter_all(patches)
             try:
                 with pytest.raises(ValueError, match="Recently Deleted"):

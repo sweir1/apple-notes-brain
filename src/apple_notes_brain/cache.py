@@ -96,40 +96,96 @@ def refresh() -> dict:
 # ---------------------------------------------------------------------------
 
 _tombstones: dict[int, float] = {}
+# Second tombstone index keyed by (parent_pk, lowercased_name).
+# Used to hide CloudKit-reconstituted folders that come back with a new
+# Z_PK after delete (per Apple Discussions #250246292) — same name +
+# parent → still hidden for the TTL window.
+_tombstones_by_name: dict[tuple[int | None, str], float] = {}
+# Third tombstone index by ZIDENTIFIER (stable UUID across Z_PK shifts).
+_tombstones_by_zid: dict[str, float] = {}
 _tomb_lock = threading.Lock()
 _TOMBSTONE_TTL_S = 60.0
 
 
-def tombstone_folder(pk: int) -> None:
-    """Mark a folder PK as 'just deleted' in the in-process cache layer.
+def tombstone_folder(
+    pk: int,
+    parent_pk: int | None = None,
+    name: str | None = None,
+    zid: str | None = None,
+) -> None:
+    """Mark a folder as 'just deleted' in the in-process cache layer.
 
     Used after a successful AppleScript folder delete to immediately hide the
     folder from list_folders(), even though the SQLite cache won't reflect the
     deletion for many seconds (CloudKit ack + Core Data save lag).
     Auto-expires after _TOMBSTONE_TTL_S so a sync-conflict resurrection
     (per Apple Discussions #250246292) eventually re-surfaces the folder.
+
+    v1.1: also tombstones by (parent_pk, lowercased name) AND ZIDENTIFIER
+    when those are provided. CloudKit can reconstitute a deleted folder
+    as a new SQLite row with a fresh Z_PK (and sometimes new ZIDENTIFIER
+    too); the name-keyed tombstone catches the reborn row regardless of
+    its new PK.
     """
+    deadline = time.monotonic() + _TOMBSTONE_TTL_S
     with _tomb_lock:
-        _tombstones[pk] = time.monotonic() + _TOMBSTONE_TTL_S
+        _tombstones[pk] = deadline
+        if name is not None:
+            _tombstones_by_name[(parent_pk, name.strip().lower())] = deadline
+        if zid is not None:
+            _tombstones_by_zid[zid] = deadline
 
 
-def is_tombstoned(pk: int) -> bool:
+def is_tombstoned(
+    pk: int,
+    *,
+    parent_pk: int | None = None,
+    name: str | None = None,
+    zid: str | None = None,
+) -> bool:
+    """Check whether a folder is tombstoned by ANY of (PK, name, zid).
+
+    Backwards compatible: callers that only pass pk get the old PK-only
+    check. Callers that pass name/zid get the broader check that also
+    hides CloudKit-reconstituted reborn rows.
+    """
+    now = time.monotonic()
     with _tomb_lock:
+        # Check PK first (most specific).
         deadline = _tombstones.get(pk)
-        if deadline is None:
-            return False
-        if time.monotonic() > deadline:
+        if deadline is not None:
+            if now <= deadline:
+                return True
             _tombstones.pop(pk, None)
-            return False
-        return True
+        # Check ZIDENTIFIER (stable across PK shifts).
+        if zid is not None:
+            deadline = _tombstones_by_zid.get(zid)
+            if deadline is not None:
+                if now <= deadline:
+                    return True
+                _tombstones_by_zid.pop(zid, None)
+        # Check (parent_pk, name) — catches reborn rows with a new PK.
+        if name is not None:
+            key = (parent_pk, name.strip().lower())
+            deadline = _tombstones_by_name.get(key)
+            if deadline is not None:
+                if now <= deadline:
+                    return True
+                _tombstones_by_name.pop(key, None)
+        return False
 
 
 def reap_tombstones() -> None:
-    """Drop expired tombstones. Cheap; safe to call from the bg loop."""
+    """Drop expired tombstones from all three indexes. Cheap; safe to
+    call from the bg loop."""
     now = time.monotonic()
     with _tomb_lock:
         for pk in [k for k, d in _tombstones.items() if d < now]:
             _tombstones.pop(pk, None)
+        for key in [k for k, d in _tombstones_by_name.items() if d < now]:
+            _tombstones_by_name.pop(key, None)
+        for zid in [k for k, d in _tombstones_by_zid.items() if d < now]:
+            _tombstones_by_zid.pop(zid, None)
 
 
 # ---------------------------------------------------------------------------

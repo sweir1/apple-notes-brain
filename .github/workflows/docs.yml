@@ -1,0 +1,110 @@
+name: Deploy docs site
+
+on:
+  push:
+    branches: [main, dev]
+    paths:
+      - docs/**
+      - website/**
+      - .github/workflows/docs.yml
+  workflow_dispatch:
+
+# Pages write / id-token are only used by the deploy job on main — the build
+# job on dev doesn't need them. Scoping widely here is fine because the
+# deploy job has its own `if:` guard below.
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+# Allow only one Pages deploy at a time; queue new runs rather than cancel in-flight ones
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: Build site (strict)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: website
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0  # git-revision-date-localized needs full history
+
+      - name: Setup Python
+        id: setup-python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+          # No `cache: pip` — we manage our own venv cache. The full venv is
+          # cached (not just the wheel cache) so `pip install` is skipped on
+          # cache hit (~30s → ~1s). Key includes the Python patch version
+          # so ABI drift can never poison a hit.
+
+      # Cache shared with ci.yml's docs-build step (same key shape).
+      # Saved by main pushes (in either workflow), restored cross-ref by
+      # everything else.
+      - name: Restore docs venv
+        uses: actions/cache/restore@v5
+        continue-on-error: true
+        id: docs-venv-restore
+        with:
+          path: ~/.venv-docs
+          key: docs-venv-${{ runner.os }}-${{ runner.arch }}-py${{ steps.setup-python.outputs.python-version }}-${{ hashFiles('website/requirements.txt') }}-v1
+
+      - name: Create docs venv + install (cache miss only)
+        if: steps.docs-venv-restore.outputs.cache-hit != 'true'
+        id: install-docs-deps
+        working-directory: ${{ github.workspace }}
+        run: |
+          python -m venv ~/.venv-docs
+          ~/.venv-docs/bin/pip install --upgrade pip
+          ~/.venv-docs/bin/pip install -r website/requirements.txt
+
+      - name: Save docs venv (main pushes only)
+        if: steps.install-docs-deps.outcome == 'success' && steps.docs-venv-restore.outputs.cache-hit != 'true' && github.ref == 'refs/heads/main' && github.event_name == 'push'
+        uses: actions/cache/save@v5
+        continue-on-error: true
+        with:
+          path: ~/.venv-docs
+          key: docs-venv-${{ runner.os }}-${{ runner.arch }}-py${{ steps.setup-python.outputs.python-version }}-${{ hashFiles('website/requirements.txt') }}-v1
+
+      - name: Add docs venv to PATH
+        working-directory: ${{ github.workspace }}
+        run: echo "$HOME/.venv-docs/bin" >> "$GITHUB_PATH"
+
+      # Runs on every triggering branch — strict build catches broken
+      # internal links, missing nav entries, and MkDocs errors on dev before
+      # the PR to main. No deploy here.
+      - name: Build site (strict)
+        run: mkdocs build --strict
+
+      # Pages artifact upload is main-only — dev never produces a deployable
+      # artifact, which means the live site can't be touched by anything
+      # that hasn't gone through dev → PR → main.
+      - name: Configure Pages
+        if: github.ref == 'refs/heads/main'
+        uses: actions/configure-pages@v6
+
+      - name: Upload artifact
+        if: github.ref == 'refs/heads/main'
+        uses: actions/upload-pages-artifact@v5
+        with:
+          path: website/site
+
+  deploy:
+    name: Deploy to GitHub Pages
+    if: github.ref == 'refs/heads/main'
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Deploy
+        id: deployment
+        uses: actions/deploy-pages@v5

@@ -34,6 +34,8 @@ from pathlib import Path
 import numpy as np
 import sqlite_vec
 
+from ._logging import debug_log
+
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -181,6 +183,7 @@ def _init_schema(conn: sqlite3.Connection) -> None:
         "VALUES ('schema_version', ?, ?)",
         (str(SCHEMA_VERSION), int(time.time())),
     )
+    debug_log(f"store: schema initialised at version={SCHEMA_VERSION}")
 
 
 def current_schema_version(conn: sqlite3.Connection) -> int:
@@ -221,9 +224,17 @@ def ensure_vec_tables(conn: sqlite3.Connection, dim: int) -> None:
     # Mismatch — check row count.
     count = conn.execute("SELECT COUNT(*) FROM chunks_vec").fetchone()[0]
     if count == 0:
+        debug_log(
+            f"store: vec dim mismatch stored={stored} embedder={dim} "
+            f"empty=True → recreating"
+        )
         conn.execute("DROP TABLE chunks_vec")
         _create_chunks_vec(conn, dim)
         return
+    debug_log(
+        f"store: vec dim mismatch stored={stored} embedder={dim} "
+        f"populated={count} → raising"
+    )
     raise DimensionMismatchError(
         f"chunks_vec was built for dim={stored} but the current embedder "
         f"emits dim={dim}. The table has {count} rows — refusing to drop. "
@@ -237,6 +248,7 @@ def _create_chunks_vec(conn: sqlite3.Connection, dim: int) -> None:
         f"embedding float[{int(dim)}])"
     )
     _set_metadata(conn, "chunks_vec_dim", str(int(dim)))
+    debug_log(f"store: chunks_vec created at dim={int(dim)}")
 
 
 def _set_metadata(conn: sqlite3.Connection, key: str, value: str) -> None:
@@ -508,6 +520,7 @@ class ChunkHit:
     end_line: int | None
     note_title: str
     score: float
+    note_folder: str | None = None
 
 
 def search_chunk_vectors(
@@ -527,7 +540,7 @@ def search_chunk_vectors(
         SELECT v.rowid, v.distance,
                c.id, c.node_id, c.chunk_index, c.heading, c.heading_level,
                c.content, c.start_line, c.end_line,
-               n.title
+               n.title, n.folder
         FROM chunks_vec v
         JOIN chunks c ON c.rowid = v.rowid
         JOIN nodes  n ON n.id    = c.node_id
@@ -548,6 +561,7 @@ def search_chunk_vectors(
             end_line=r[9],
             note_title=r[10],
             score=1.0 - float(r[1]),
+            note_folder=r[11],
         )
         for r in rows
     ]
@@ -602,7 +616,74 @@ def record_failed_chunk(
 
 
 def count_failed_chunks(conn: sqlite3.Connection) -> int:
+    """Total failed_chunks rows, including `reason='locked'` placeholders.
+
+    Prefer `count_failed_chunks_by_reason` + the split in
+    `IndexStatus.total_failed_chunks` / `IndexStatus.locked_notes` for
+    user-facing reporting — locked notes aren't failures.
+    """
     return int(conn.execute("SELECT COUNT(*) FROM failed_chunks").fetchone()[0])
+
+
+def count_failed_chunks_by_reason(
+    conn: sqlite3.Connection,
+) -> dict[str, int]:
+    rows = conn.execute(
+        "SELECT reason, COUNT(*) FROM failed_chunks GROUP BY reason"
+    ).fetchall()
+    return {str(r[0]): int(r[1]) for r in rows}
+
+
+def clear_failed_chunks(conn: sqlite3.Connection) -> int:
+    """Delete every row from failed_chunks. Returns the row count
+    deleted, excluding `reason='locked'` placeholders (locked notes
+    are an expected state, not a failure to "clear").
+
+    Used by `reindex_semantic(force=True)` to reset the persistent
+    failure counter that otherwise sticks around even after the
+    original failure has been resolved by a subsequent successful
+    pass. The cleared-count returned to the caller maps to
+    `prior_failures_cleared` in the tool response — locked-row deletes
+    are not user-visible because they re-create on the next pass.
+    """
+    real_failures = int(
+        conn.execute(
+            "SELECT COUNT(*) FROM failed_chunks WHERE reason != 'locked'"
+        ).fetchone()[0]
+    )
+    conn.execute("DELETE FROM failed_chunks")
+    return real_failures
+
+
+def list_failed_chunk_ids(
+    conn: sqlite3.Connection,
+    *,
+    limit: int = 50,
+    exclude_locked: bool = True,
+) -> list[str]:
+    """Return up to `limit` failed chunk IDs, most-recent first.
+
+    Used by `semantic_index_status` to surface which chunks are
+    currently failing so the caller can correlate with the
+    `total_failed_chunks` counter. By default excludes
+    `reason='locked'` rows — those aren't failures, they're expected
+    placeholders for password-protected notes (surfaced under
+    `locked_notes` instead).
+    """
+    if limit <= 0:
+        return []
+    if exclude_locked:
+        sql = (
+            "SELECT chunk_id FROM failed_chunks WHERE reason != 'locked' "
+            "ORDER BY failed_at DESC, chunk_id ASC LIMIT ?"
+        )
+    else:
+        sql = (
+            "SELECT chunk_id FROM failed_chunks "
+            "ORDER BY failed_at DESC, chunk_id ASC LIMIT ?"
+        )
+    rows = conn.execute(sql, (int(limit),)).fetchall()
+    return [str(r[0]) for r in rows]
 
 
 # ---------------------------------------------------------------------------
@@ -613,7 +694,9 @@ def count_failed_chunks(conn: sqlite3.Connection) -> int:
 class IndexStatus:
     total_nodes: int
     total_chunks: int
-    total_failed_chunks: int
+    total_failed_chunks: int  # excludes reason='locked'
+    locked_notes: int  # reason='locked' placeholders only
+    failed_chunks_by_reason: dict[str, int]  # excludes 'locked' key
     chunks_vec_dim: int | None
     schema_version: int
     last_indexed_at: int | None
@@ -628,10 +711,15 @@ def index_status(conn: sqlite3.Connection) -> IndexStatus:
         vec_version = conn.execute("SELECT vec_version()").fetchone()[0]
     except sqlite3.OperationalError:
         vec_version = None
+    by_reason = count_failed_chunks_by_reason(conn)
+    locked_notes = by_reason.pop("locked", 0)
+    real_failures = sum(by_reason.values())
     return IndexStatus(
         total_nodes=total_nodes,
         total_chunks=total_chunks,
-        total_failed_chunks=count_failed_chunks(conn),
+        total_failed_chunks=real_failures,
+        locked_notes=locked_notes,
+        failed_chunks_by_reason=by_reason,
         chunks_vec_dim=chunks_vec_dim(conn),
         schema_version=current_schema_version(conn),
         last_indexed_at=int(last_indexed) if last_indexed else None,

@@ -50,6 +50,7 @@ classifiers = [
     "Typing :: Typed",
 ]
 dependencies = [
+    "bleach>=6.0",
     "markdown>=3.5",
     "markdownify>=0.11",
     "lxml>=4.9",
@@ -94,13 +95,22 @@ semantic = [
     "httpx>=0.27",
     "numpy>=1.24",
 ]
+# Documentation site (MkDocs Material). Only needed to build/serve the docs
+# locally and in CI — not required to run apple-notes-brain. Install with:
+#   uv sync --extra docs
+# Kept minimal on purpose: the docs venv in CI restores in <1s on cache hit.
+docs = [
+    "mkdocs-material~=9.7",
+    "mkdocs-git-revision-date-localized-plugin~=1.5",
+    "mkdocs-macros-plugin~=1.5",
+]
 
 [project.urls]
-Homepage = "https://github.com/sweir1/apple-notes-brain"
+Homepage = "https://sweir1.github.io/apple-notes-brain/"
 Repository = "https://github.com/sweir1/apple-notes-brain"
 Issues = "https://github.com/sweir1/apple-notes-brain/issues"
-Changelog = "https://github.com/sweir1/apple-notes-brain/releases"
-Documentation = "https://github.com/sweir1/apple-notes-brain#readme"
+Changelog = "https://sweir1.github.io/apple-notes-brain/CHANGELOG/"
+Documentation = "https://sweir1.github.io/apple-notes-brain/"
 "Source Code" = "https://github.com/sweir1/apple-notes-brain"
 
 [project.scripts]
@@ -112,10 +122,19 @@ build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/apple_notes_brain"]
+# Hatchling already includes package-internal data files when they live
+# inside the package, but we list it here explicitly belt-and-braces:
+# `data/seed-models.json` is load-bearing for the metadata resolver
+# chain (Phase γ). If it's missing from the wheel, the resolver silently
+# falls back to the live HF fetcher (slow + offline-broken).
+include = [
+    "src/apple_notes_brain/data/*.json",
+]
 
 [tool.hatch.build.targets.sdist]
 include = [
     "src/apple_notes_brain",
+    "src/apple_notes_brain/data/*.json",
     "README.md",
     "LICENSE",
     "pyproject.toml",

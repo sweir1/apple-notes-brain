@@ -108,6 +108,16 @@ class Embedder(Protocol):
     def dispose(self) -> None:
         """Release resources. Idempotent."""
 
+    def set_metadata(self, meta: "EmbedderMetadata") -> None:
+        """Attach resolved metadata so embed() can apply per-task prefixes.
+
+        Idempotent — safe to call multiple times. Replaces any previously
+        attached metadata. The asymmetric prefixes are read from the
+        passed-in record on every embed() call (no caching), so future
+        re-resolution after a prefix-strategy change just needs another
+        set_metadata() — no embedder restart required.
+        """
+
 
 # ---------------------------------------------------------------------------
 # Embedder metadata — resolved once at init; cached in embedder_capability
@@ -179,13 +189,26 @@ class SearchResult:
     score: float           # higher = better (cosine similarity for semantic,
                            # negated BM25 for fulltext, RRF sum for hybrid)
     excerpt: str = ""
+    folder: str | None = None
 
 
 @dataclass
 class ChunkAwareResult(SearchResult):
     """Note-level hit with chunk metadata attached. The chunk_* fields are
     populated when `unique='chunks'` — they reveal which span of the note
-    matched, useful for UI excerpts."""
+    matched, useful for UI excerpts.
+
+    Score-field semantics (post v1.1 fix):
+      * `semantic_score`: raw cosine similarity from the kNN ranker, or
+        None if this hit only came in via fulltext.
+      * `lexical_score`: negated-BM25 from the fulltext ranker, or None
+        if this hit only came in via semantic.
+      * `fused_score`: the RRF (reciprocal-rank-fusion) sum across the
+        two ranker outputs, populated by `Search.hybrid`. None for pure
+        single-ranker calls (`Search.semantic_chunks`, `Search.fulltext`).
+      * `score`: the field used for sorting. For pure semantic calls it
+        equals `semantic_score`; for hybrid it equals `fused_score`.
+    """
     chunk_id: str | None = None
     chunk_heading: str | None = None
     chunk_start_line: int | None = None
@@ -193,6 +216,7 @@ class ChunkAwareResult(SearchResult):
     chunk_excerpt: str = ""
     semantic_score: float | None = None
     lexical_score: float | None = None
+    fused_score: float | None = None
 
 
 # ---------------------------------------------------------------------------

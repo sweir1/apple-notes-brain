@@ -120,6 +120,61 @@ class TestTombstones:
 
 
 # ---------------------------------------------------------------------------
+# v1.1 Part 4 Phase 4 — tombstone by name + zid (CloudKit reborn rows)
+# ---------------------------------------------------------------------------
+
+class TestTombstoneByName:
+    def test_tombstone_by_name_hides_reborn_pk(self, frozen_monotonic):
+        """Folder gets new Z_PK after CloudKit reconstitutes, but the
+        (parent, name) tombstone still hides it."""
+        cache.tombstone_folder(99, parent_pk=4, name="MyFolder", zid="zid-abc")
+        # Reborn row comes back with a NEW Z_PK (e.g. 105) but same
+        # parent + name. The PK-keyed check misses, the name-keyed check
+        # catches.
+        assert cache.is_tombstoned(105, parent_pk=4, name="MyFolder") is True
+
+    def test_tombstone_by_zid_hides_reborn_pk_with_new_name(self, frozen_monotonic):
+        """If the reborn row happens to keep the same ZIDENTIFIER but
+        gets a new PK, the zid-keyed tombstone catches it."""
+        cache.tombstone_folder(99, parent_pk=4, name="MyFolder", zid="zid-abc")
+        # Reborn with new PK + different name but SAME zid.
+        assert cache.is_tombstoned(106, zid="zid-abc") is True
+
+    def test_name_match_is_case_insensitive(self, frozen_monotonic):
+        cache.tombstone_folder(99, parent_pk=4, name="MyFolder")
+        assert cache.is_tombstoned(105, parent_pk=4, name="myfolder") is True
+        assert cache.is_tombstoned(105, parent_pk=4, name="MYFOLDER") is True
+
+    def test_name_match_with_different_parent_does_not_hide(self, frozen_monotonic):
+        """A folder with the same name but under a different parent is
+        NOT hidden — that's a legitimately different folder."""
+        cache.tombstone_folder(99, parent_pk=4, name="MyFolder")
+        # Same name, different parent (or no parent) → not tombstoned.
+        assert cache.is_tombstoned(105, parent_pk=5, name="MyFolder") is False
+        assert cache.is_tombstoned(105, parent_pk=None, name="MyFolder") is False
+
+    def test_name_tombstone_expires_at_ttl(self, frozen_monotonic):
+        cache.tombstone_folder(99, parent_pk=4, name="MyFolder")
+        frozen_monotonic.advance(60.0001)
+        assert cache.is_tombstoned(105, parent_pk=4, name="MyFolder") is False
+
+    def test_reap_drops_expired_name_and_zid_entries(self, frozen_monotonic):
+        cache.tombstone_folder(99, parent_pk=4, name="MyFolder", zid="zid-abc")
+        frozen_monotonic.advance(70)
+        cache.reap_tombstones()
+        with cache._tomb_lock:
+            assert (4, "myfolder") not in cache._tombstones_by_name
+            assert "zid-abc" not in cache._tombstones_by_zid
+
+    def test_pk_only_check_back_compat(self, frozen_monotonic):
+        """Existing PK-only call sites (no name/zid passed) still work."""
+        cache.tombstone_folder(99, parent_pk=4, name="MyFolder")
+        # Caller doesn't know about name/zid, just passes the PK.
+        assert cache.is_tombstoned(99) is True
+        assert cache.is_tombstoned(200) is False
+
+
+# ---------------------------------------------------------------------------
 # Rename overlays
 # ---------------------------------------------------------------------------
 

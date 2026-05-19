@@ -32,15 +32,55 @@ jobs:
       # fails on it. Force every step (setup-uv, uv sync, uv run) to use
       # uv's own managed Python which DOES support loadable extensions.
       UV_PYTHON_PREFERENCE: only-managed
+      # Pin huggingface_hub model cache to a known workspace path so
+      # actions/cache can restore + save it across runs. The ONNX embedder
+      # (`semantic/embedder/onnx.py`) and the prefetch step below both
+      # honour HF_HOME, which huggingface_hub treats as the root for its
+      # cache. Without this override, models land in the user-cache
+      # default (~/.cache/huggingface) which is harder to scope to the
+      # workspace and slower to cache. Mirrors obsidian-brain's
+      # TRANSFORMERS_CACHE pattern (TS/Node equivalent).
+      HF_HOME: ${{ github.workspace }}/.cache/huggingface
     steps:
       - name: Check out
         uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          # gen_readme_recent.py filters CHANGELOG entries by `git tag`
+          # presence; without tag refs the script would render an empty
+          # "Recent releases" block and the drift check would fail.
+          fetch-tags: true
+          fetch-depth: 0
 
       - name: Set up uv + Python 3.11 (managed)
         uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b # v8.1.0
         with:
           python-version: "3.11"
           enable-cache: true
+
+      - name: Restore HuggingFace model cache
+        # Split restore/save so we only persist the cache AFTER prefetch
+        # verifies integrity (see the "Save" step below). Without this
+        # split, actions/cache's default post-step would save the cache
+        # directory unconditionally — including any partial downloads left
+        # behind by a killed run. That's the same defence obsidian-brain
+        # uses against the "Protobuf parsing failed" class of cache-
+        # poisoning bugs.
+        #
+        # Shared across main + dev + PRs via the restore-keys ladder:
+        # actions/cache writes are scoped per-branch, but restore-keys
+        # fall through to the default branch, so dev / PR runs read from
+        # main's cache when their own isn't populated. The save step
+        # (below) is gated to main pushes only, keeping the saved cache
+        # canonical.
+        uses: actions/cache/restore@v5
+        continue-on-error: true
+        id: hf-cache-restore
+        with:
+          path: ${{ github.workspace }}/.cache/huggingface
+          key: hf-models-bge-small-en-v1.5-v1
+          restore-keys: |
+            hf-models-bge-small-en-v1.5-
+            hf-models-
 
       - name: Install dependencies
         # Install BOTH extras: the dev tooling AND the semantic stack
@@ -50,12 +90,141 @@ jobs:
         # separate venv-without-extras CI job for that.
         run: uv sync --extra dev --extra semantic
 
+      - name: Drift checks (generated docs, version sync, env-vars)
+        # Hard gate: every auto-generated marker region in the repo must
+        # match what its generator script would write. If a contributor
+        # edited server.json env vars, the source's `@_mcp_tool` set, or
+        # docs/CHANGELOG.md without rerunning the generators, this step
+        # fails with a unified diff in the log.
+        #
+        # The check also enforces that the version is in lock-step
+        # across pyproject.toml + server.json (top-level + packages[0]).
+        run: |
+          uv run python scripts/sync_version.py --check
+          uv run python scripts/check_env_vars.py
+          uv run python scripts/gen_docs.py --check
+          uv run python scripts/gen_tools_docs.py --check
+          uv run python scripts/gen_readme_recent.py --check
+
+      - name: Spell check (codespell, best-effort)
+        # Non-blocking: codespell is opinionated and we don't want to
+        # gate CI on a false positive. Allowlisted terms live in
+        # .codespellrc.
+        continue-on-error: true
+        run: |
+          uv run --with codespell codespell \
+            docs/ README.md RELEASING.md \
+            scripts/*.py website/*.py website/*.yml \
+            || true
+
+      - name: Restore MTEB venv (for seed-drift check)
+        # MTEB ships torch + datasets + ~30 other heavy deps; install
+        # takes ~60s. We cache the FULL populated venv at ~/.venv-mteb
+        # (not just the pip wheel cache) so a cache hit skips pip
+        # entirely and we go straight to running build-seed.py.
+        #
+        # Restore-only on validate; the SAVE lives in the `warm-mteb-venv`
+        # job below which runs on main pushes only. PRs / dev pushes read
+        # main's cache via cross-ref fallthrough; if main has never warmed
+        # the cache, this restore is a miss and we skip the drift check
+        # (see `continue-on-error: true` + the `if` guard on the next step).
+        #
+        # Cache key shape (mteb-venv-<os>-<arch>-py<full-patch>-<reqs-hash>-v1):
+        # py<full-patch> is CRITICAL — venv shebangs and torch native ABI
+        # break on Python patch drift. No restore-keys fallback for the
+        # same reason: a partial cache miss is preferable to restoring a
+        # venv that segfaults on import.
+        uses: actions/cache/restore@v5
+        continue-on-error: true
+        id: mteb-venv-restore
+        with:
+          path: ~/.venv-mteb
+          key: mteb-venv-${{ runner.os }}-${{ runner.arch }}-py${{ steps.setup-uv.outputs.python-version || '3.11' }}-${{ hashFiles('scripts/requirements-build-seed.txt') }}-v1
+
+      - name: Seed-drift check (cache hit only)
+        # If the MTEB venv was warmed by a prior main push (cross-ref
+        # fallthrough), regenerate the seed JSON and assert it matches
+        # the committed src/apple_notes_brain/data/seed-models.json.
+        # Drift = author committed source changes that bumped the seed
+        # output without committing the new seed; fail with a clear
+        # remediation message.
+        #
+        # If the cache MISSED (e.g. first PR after a key change, or
+        # main has never warmed), skip the check — we don't want every
+        # PR to pay the 60s MTEB install cost. The `warm-mteb-venv` job
+        # on main pushes ensures the cache is populated for descendants.
+        if: steps.mteb-venv-restore.outputs.cache-hit == 'true'
+        run: |
+          set -euo pipefail
+          tmp=$(mktemp -d)
+          cp src/apple_notes_brain/data/seed-models.json "$tmp/committed.json"
+          ~/.venv-mteb/bin/python scripts/build-seed.py
+          # Compare model dict only — ignore $generatedAt timestamp drift
+          python3 - <<PYEOF
+          import json, sys
+          committed = json.load(open("$tmp/committed.json"))["models"]
+          regen = json.load(open("src/apple_notes_brain/data/seed-models.json"))["models"]
+          if committed != regen:
+              missing_in_committed = set(regen) - set(committed)
+              missing_in_regen = set(committed) - set(regen)
+              changed = [k for k in set(regen) & set(committed) if regen[k] != committed[k]]
+              print("::error title=seed drift detected::seed-models.json is stale", file=sys.stderr)
+              print(f"  added by MTEB upstream: {sorted(missing_in_committed)[:10]}", file=sys.stderr)
+              print(f"  removed by MTEB upstream: {sorted(missing_in_regen)[:10]}", file=sys.stderr)
+              print(f"  prefix/max_tokens changed: {sorted(changed)[:10]}", file=sys.stderr)
+              print("Regenerate with: make refresh-seed (or scripts/build-seed.py via the MTEB venv) and commit.", file=sys.stderr)
+              sys.exit(1)
+          print(f"seed-drift check: {len(regen)} entries match committed copy")
+          PYEOF
+          # Restore the committed copy so subsequent steps see what was checked in.
+          cp "$tmp/committed.json" src/apple_notes_brain/data/seed-models.json
+
+      - name: Prefetch ONNX model (so the slow integration test is fast)
+        # Runs BEFORE pytest so flaky HF downloads can't surface as opaque
+        # ONNX-parsing errors inside a failing test suite. Warms the cache
+        # deterministically so the end-to-end ONNX integration test
+        # (test_end_to_end_onnx.py) just reads from disk — no parallel-
+        # download races between test files. Targets the same model
+        # apple-notes-brain ships as DEFAULT_MODEL_PRESET (bge-small-en-v1.5);
+        # bump alongside the default if it ever changes.
+        id: prefetch
+        run: |
+          uv run python -c "
+          from huggingface_hub import hf_hub_download
+          import os
+          cache = os.environ['HF_HOME']
+          for fname in ['onnx/model_quantized.onnx', 'tokenizer.json']:
+              hf_hub_download(repo_id='Xenova/bge-small-en-v1.5', filename=fname, cache_dir=cache)
+          print('prefetch ok')
+          "
+        continue-on-error: false
+
       - name: Run pytest with coverage
         run: |
           uv run pytest -q \
             --cov-report=term-missing \
             --cov-report=xml \
             --cov-report=html
+
+      - name: Save HuggingFace model cache
+        # Only save when (a) prefetch succeeded AND (b) the cache was a
+        # miss on restore AND (c) we're on a main push.
+        #
+        # (a) prevents persisting a corrupt partial download under the
+        #     key — same defence as obsidian-brain.
+        # (b) skips the no-op write when an exact-key hit means nothing
+        #     changed.
+        # (c) keeps the saved cache canonical to main's state so
+        #     release.yml (which runs on tag pushes against arbitrary
+        #     refs) reliably reads main's cache via cross-ref fallthrough.
+        #     Dev / PR runs benefit from main's cache on read but don't
+        #     pollute it on write.
+        if: steps.prefetch.outcome == 'success' && steps.hf-cache-restore.outputs.cache-hit != 'true' && github.ref == 'refs/heads/main' && github.event_name == 'push'
+        uses: actions/cache/save@v5
+        continue-on-error: true
+        with:
+          path: ${{ github.workspace }}/.cache/huggingface
+          key: hf-models-bge-small-en-v1.5-v1
 
       - name: Run MCP smoke tests (subset; coverage already measured above)
         run: uv run pytest --no-cov -m integration -v tests/integration/test_mcp_smoke.py
@@ -88,3 +257,125 @@ jobs:
           path: dist/
           retention-days: 7
           if-no-files-found: error
+
+  # ─── Strict docs build (catches broken anchors + nav + macros) ───────
+  #
+  # Validates `mkdocs build --strict` on every push/PR. Pages deploy is
+  # owned by docs.yml on main pushes only — this job here is the gate
+  # that ensures whatever lands on main builds cleanly first. Runs on
+  # ubuntu (cheaper than macos-latest) because MkDocs has no platform-
+  # specific behaviour for our content.
+  docs-build-strict:
+    name: Docs build (strict)
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    defaults:
+      run:
+        working-directory: website
+    steps:
+      - name: Checkout
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          # git-revision-date-localized needs full history to render
+          # the per-page "last updated" date in the footer.
+          fetch-depth: 0
+
+      - name: Setup Python
+        id: setup-python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - name: Restore docs venv
+        uses: actions/cache/restore@v5
+        continue-on-error: true
+        id: docs-venv-restore
+        with:
+          path: ~/.venv-docs
+          key: docs-venv-${{ runner.os }}-${{ runner.arch }}-py${{ steps.setup-python.outputs.python-version }}-${{ hashFiles('website/requirements.txt') }}-v1
+
+      - name: Create docs venv + install (cache miss only)
+        if: steps.docs-venv-restore.outputs.cache-hit != 'true'
+        id: install-docs-deps
+        working-directory: ${{ github.workspace }}
+        run: |
+          python -m venv ~/.venv-docs
+          ~/.venv-docs/bin/pip install --upgrade pip
+          ~/.venv-docs/bin/pip install -r website/requirements.txt
+
+      - name: Save docs venv (main pushes only)
+        if: steps.install-docs-deps.outcome == 'success' && steps.docs-venv-restore.outputs.cache-hit != 'true' && github.ref == 'refs/heads/main' && github.event_name == 'push'
+        uses: actions/cache/save@v5
+        continue-on-error: true
+        with:
+          path: ~/.venv-docs
+          key: docs-venv-${{ runner.os }}-${{ runner.arch }}-py${{ steps.setup-python.outputs.python-version }}-${{ hashFiles('website/requirements.txt') }}-v1
+
+      - name: Add docs venv to PATH
+        working-directory: ${{ github.workspace }}
+        run: echo "$HOME/.venv-docs/bin" >> "$GITHUB_PATH"
+
+      - name: Build site (strict)
+        run: mkdocs build --strict
+
+  # ─── Warm the MTEB venv on the default-branch scope ──────────────────
+  #
+  # GitHub Actions caches are scoped per-ref. A workflow run on a tag push
+  # (release.yml) saves under that tag's ref; tags are sibling refs and
+  # CAN'T share caches with each other. The workaround: caches saved on
+  # the default branch (main) fall through to all other refs, including
+  # tags. So we save the MTEB venv here on `push: main` only, and
+  # release.yml's seed-regen step reads it via cross-ref fallthrough.
+  #
+  # Mirrors obsidian-brain `.github/workflows/ci.yml`'s `warm-mteb-venv`
+  # job. ~/.venv-mteb is ~700MB after MTEB + torch + datasets are
+  # installed; caching the populated venv (rather than ~/.cache/pip)
+  # drops ~60s of `pip install` to ~1s on hit.
+  warm-mteb-venv:
+    name: Warm MTEB venv (main only)
+    runs-on: ubuntu-latest
+    # Only main pushes — not dev, not PRs. Cache scope on main falls
+    # through to release.yml's tag-triggered runs.
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+
+      - name: Setup Python 3.11
+        id: setup-python
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.11'
+          # No `cache: pip` — we manage the full venv cache below.
+
+      - name: Restore MTEB venv
+        uses: actions/cache/restore@v5
+        continue-on-error: true
+        id: mteb-venv-restore
+        with:
+          path: ~/.venv-mteb
+          key: mteb-venv-${{ runner.os }}-${{ runner.arch }}-py${{ steps.setup-python.outputs.python-version }}-${{ hashFiles('scripts/requirements-build-seed.txt') }}-v1
+
+      - name: Create venv + install mteb (cache miss only)
+        if: steps.mteb-venv-restore.outputs.cache-hit != 'true'
+        id: install-mteb
+        run: |
+          python -m venv ~/.venv-mteb
+          ~/.venv-mteb/bin/pip install --upgrade pip
+          ~/.venv-mteb/bin/pip install -r scripts/requirements-build-seed.txt
+
+      - name: Save MTEB venv
+        # Save ONLY when install succeeded (avoids persisting a venv
+        # whose pip install was killed mid-write) AND we were a cache
+        # miss (an exact-key hit means nothing changed).
+        if: steps.install-mteb.outcome == 'success' && steps.mteb-venv-restore.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v5
+        continue-on-error: true
+        with:
+          path: ~/.venv-mteb
+          key: mteb-venv-${{ runner.os }}-${{ runner.arch }}-py${{ steps.setup-python.outputs.python-version }}-${{ hashFiles('scripts/requirements-build-seed.txt') }}-v1

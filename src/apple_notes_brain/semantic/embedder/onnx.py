@@ -25,9 +25,11 @@ from typing import Any, Literal
 
 import numpy as np
 
+from .._logging import debug_log
 from ..config import SemanticConfig
 from ..types import (
     EmbedderDeadError,
+    EmbedderMetadata,
     ModelDownloadError,
     ModelLoadError,
     TooLongError,
@@ -63,6 +65,10 @@ class OnnxEmbedder:
         self._providers: tuple[str, ...] = self._default_providers()
         self._max_tokens = _DEFAULT_MAX_TOKENS
         self._disposed = False
+        # Resolved per-model metadata — attached post-init() by the
+        # metadata-resolver chain. None means "no prefixes applied; assume
+        # a symmetric model" (the original v1.1.0 behaviour).
+        self._metadata: EmbedderMetadata | None = None
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -89,12 +95,22 @@ class OnnxEmbedder:
             self._tokenizer = self._build_tokenizer(tokenizer_path)
             self._session = self._build_session(model_path)
             self._dim = self._probe_dim()
+            try:
+                active = list(self._session.get_providers())
+            except Exception:
+                active = []
+            _log.info(
+                "onnx embedder ready: dim=%d providers=%s",
+                self._dim,
+                active,
+            )
         except (ModelLoadError, ModelDownloadError) as exc:
             if not retry:
                 raise
             if isinstance(exc, ModelDownloadError):
                 # Download errors aren't fixable by a cache wipe — re-raise.
                 raise
+            debug_log(f"onnx: load failed, clearing cache and retrying — {exc}")
             _log.warning(
                 "apple-notes-brain: ONNX model load failed (%s); clearing "
                 "the model cache for %s and retrying once.",
@@ -119,6 +135,10 @@ class OnnxEmbedder:
 
     def _download(self, filename: str) -> Path:
         """Wrap huggingface_hub.hf_hub_download with our error type."""
+        debug_log(
+            f"onnx: downloading {filename} from {self._repo_id} "
+            f"→ {self._cfg.model_cache}"
+        )
         try:
             from huggingface_hub import hf_hub_download
         except ImportError as exc:
@@ -152,6 +172,7 @@ class OnnxEmbedder:
             raise ModelLoadError(
                 f"Failed to load tokenizer from {tokenizer_path}: {exc}"
             ) from exc
+        debug_log("onnx: tokenizer loaded")
         # Enable truncation at the model's max-length so >512-token inputs
         # don't crash session.run with shape mismatches.
         tok.enable_truncation(max_length=self._max_tokens)
@@ -164,6 +185,7 @@ class OnnxEmbedder:
             raise ImportError(
                 "onnxruntime is required for the ONNX embedder."
             ) from exc
+        debug_log(f"onnx: building session with providers={list(self._providers)}")
         try:
             session = ort.InferenceSession(str(model_path), providers=list(self._providers))
         except Exception as exc:
@@ -219,17 +241,41 @@ class OnnxEmbedder:
                 "OnnxEmbedder.embed() called before init(); call init() first."
             )
         # task_type is folded into prefix injection for asymmetric models;
-        # for symmetric models (BGE-small, MiniLM) it's a no-op. We don't
-        # currently have per-model prefix metadata so we accept the input
-        # text verbatim. (Future work: wire metadata-resolver.)
+        # for symmetric models (BGE-small, MiniLM) the resolved metadata
+        # carries empty strings for both prefixes so this is a no-op.
+        # When metadata hasn't been attached yet we treat that as
+        # symmetric — preserves the pre-Phase-δ behaviour on the initial
+        # boot pass before the resolver fires.
+        prefixed = self._apply_prefix(text, task_type)
         try:
-            return self._run_session_pooled(text)
+            return self._run_session_pooled(prefixed)
         except TooLongError:
             raise
         except Exception as exc:
             raise EmbedderDeadError(
                 f"OnnxEmbedder.embed() failed: {exc}"
             ) from exc
+
+    def set_metadata(self, meta: EmbedderMetadata) -> None:
+        """Attach resolved metadata. Idempotent — last call wins."""
+        self._metadata = meta
+
+    def _apply_prefix(
+        self, text: str, task_type: Literal["document", "query"] | None
+    ) -> str:
+        """Prepend the query / document prefix from resolved metadata.
+
+        ``task_type='query'`` → query_prefix; ``'document'`` or ``None`` →
+        document_prefix. An empty-string prefix is a no-op (returns
+        ``text`` unchanged). No metadata at all is also a no-op.
+        """
+        meta = self._metadata
+        if meta is None:
+            return text
+        prefix = meta.query_prefix if task_type == "query" else meta.document_prefix
+        if not prefix:
+            return text
+        return prefix + text
 
     def dimensions(self) -> int:
         if self._dim is None:

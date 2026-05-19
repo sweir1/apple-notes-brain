@@ -462,8 +462,206 @@ def test_attachment_count_with_attachments(notestore_path, tmp_path, monkeypatch
     db_path = tmp_path / "NoteStore_attach.sqlite"
     _build_db(db_path, extra_sql=extra)
     _patch_notestore(monkeypatch, db_path)
+    # attachment_count is the RAW Z_ENT=5 total (including tables) —
+    # back-compat hatch for callers that want everything.
     assert db.attachment_count(10) == 2
     assert db.attachment_count(11) == 0
+
+
+# ---------------------------------------------------------------------------
+# v1.1 Part 4 Phase 3 — nested attachment breakdown
+# ---------------------------------------------------------------------------
+
+def _attachment_breakdown_fixture(tmp_path, monkeypatch, note_pk: int, rows: list[tuple]):
+    """Build a NoteStore with arbitrary (uti, filename, has_pdf) attachment rows."""
+    inserts = []
+    for i, (uti, filename, has_pdf) in enumerate(rows, start=200):
+        uti_val = f"'{uti}'" if uti else "NULL"
+        fn_val = f"'{filename}'" if filename else "NULL"
+        pdf_val = "X'01'" if has_pdf else "NULL"
+        inserts.append(
+            f"INSERT INTO ZICCLOUDSYNCINGOBJECT "
+            f"(Z_PK, Z_ENT, ZNOTE, ZTYPEUTI, ZFILENAME, ZFALLBACKPDFGENERATION) "
+            f"VALUES ({i}, 5, {note_pk}, {uti_val}, {fn_val}, {pdf_val});"
+        )
+    extra = "\n".join(inserts)
+    db_path = tmp_path / f"NoteStore_breakdown_{note_pk}.sqlite"
+    _build_db(db_path, extra_sql=extra)
+    _patch_notestore(monkeypatch, db_path)
+
+
+def test_attachment_breakdown_empty(notestore_path):
+    out = db.attachment_breakdown(10)
+    # All 6 buckets initialised with count=0 even when there are no attachments.
+    assert set(out.keys()) == {"image", "sketch", "scan", "audio", "file", "table"}
+    assert all(b["count"] == 0 for b in out.values())
+    assert out["table"]["destructive"] is False
+    assert out["image"]["destructive"] is True
+
+
+def test_attachment_breakdown_image_jpegs(tmp_path, monkeypatch):
+    _attachment_breakdown_fixture(tmp_path, monkeypatch, 10, [
+        ("public.jpeg", "photo.jpg", False),
+        ("public.jpeg", "photo2.jpg", False),
+    ])
+    out = db.attachment_breakdown(10)
+    assert out["image"]["count"] == 2
+    assert out["image"]["utis"] == ["public.jpeg"]
+    assert out["image"]["filenames"] == ["photo.jpg", "photo2.jpg"]
+
+
+def test_attachment_breakdown_all_image_variants(tmp_path, monkeypatch):
+    """jpeg/png/heic/svg-image all bucket as 'image'."""
+    _attachment_breakdown_fixture(tmp_path, monkeypatch, 10, [
+        ("public.jpeg", None, False),
+        ("public.png", None, False),
+        ("public.heic", None, False),
+        ("public.svg-image", None, False),
+    ])
+    out = db.attachment_breakdown(10)
+    assert out["image"]["count"] == 4
+    assert set(out["image"]["utis"]) == {
+        "public.jpeg", "public.png", "public.heic", "public.svg-image",
+    }
+
+
+def test_attachment_breakdown_sketch_uses_apple_paper(tmp_path, monkeypatch):
+    """iOS 17+ PaperKit sketches show up as com.apple.paper, mapping to 'sketch'."""
+    _attachment_breakdown_fixture(tmp_path, monkeypatch, 10, [
+        ("com.apple.paper", None, False),
+        ("com.apple.drawing.2", None, False),
+    ])
+    out = db.attachment_breakdown(10)
+    assert out["sketch"]["count"] == 2
+    assert out["sketch"]["destructive"] is True
+
+
+def test_attachment_breakdown_audio_variants(tmp_path, monkeypatch):
+    """m4a-audio, mpeg-4-audio, generic public.audio all bucket as 'audio'."""
+    _attachment_breakdown_fixture(tmp_path, monkeypatch, 10, [
+        ("com.apple.m4a-audio", "rec.m4a", False),
+        ("public.mpeg-4-audio", "song.mp4", False),
+        ("public.audio", None, False),
+    ])
+    out = db.attachment_breakdown(10)
+    assert out["audio"]["count"] == 3
+
+
+def test_attachment_breakdown_scan_via_gallery_and_scan_uti(tmp_path, monkeypatch):
+    _attachment_breakdown_fixture(tmp_path, monkeypatch, 10, [
+        ("com.apple.notes.gallery", None, False),
+        ("com.apple.notes.scan", None, False),
+    ])
+    out = db.attachment_breakdown(10)
+    assert out["scan"]["count"] == 2
+
+
+def test_attachment_breakdown_scan_via_pdf_fallback(tmp_path, monkeypatch):
+    """A row with non-null ZFALLBACKPDFGENERATION buckets as scan even
+    when its ZTYPEUTI doesn't match the scan UTIs (legacy schema)."""
+    _attachment_breakdown_fixture(tmp_path, monkeypatch, 10, [
+        ("some-legacy-uti", None, True),  # has_pdf=True
+    ])
+    out = db.attachment_breakdown(10)
+    assert out["scan"]["count"] == 1
+
+
+def test_attachment_breakdown_table_is_non_destructive(tmp_path, monkeypatch):
+    _attachment_breakdown_fixture(tmp_path, monkeypatch, 10, [
+        ("com.apple.notes.table", None, False),
+    ])
+    out = db.attachment_breakdown(10)
+    assert out["table"]["count"] == 1
+    assert out["table"]["destructive"] is False
+
+
+def test_attachment_breakdown_unknown_uti_buckets_as_file(tmp_path, monkeypatch):
+    """User-attached PDFs / ZIPs / etc. with unknown UTIs default to
+    'file' bucket (destructive — conservative)."""
+    _attachment_breakdown_fixture(tmp_path, monkeypatch, 10, [
+        ("com.adobe.pdf", "doc.pdf", False),
+        ("public.zip-archive", "archive.zip", False),
+        (None, "no_uti.bin", False),
+    ])
+    out = db.attachment_breakdown(10)
+    assert out["file"]["count"] == 3
+    assert out["file"]["destructive"] is True
+
+
+def test_destructive_attachment_count_excludes_table(tmp_path, monkeypatch):
+    _attachment_breakdown_fixture(tmp_path, monkeypatch, 10, [
+        ("public.jpeg", None, False),
+        ("public.jpeg", None, False),
+        ("com.apple.notes.table", None, False),
+    ])
+    assert db.destructive_attachment_count(10) == 2
+    # And the raw count still sees all three rows (back-compat).
+    assert db.attachment_count(10) == 3
+
+
+def test_destructive_attachment_count_zero_when_table_only(tmp_path, monkeypatch):
+    _attachment_breakdown_fixture(tmp_path, monkeypatch, 10, [
+        ("com.apple.notes.table", None, False),
+    ])
+    assert db.destructive_attachment_count(10) == 0
+    assert db.attachment_count(10) == 1  # raw count still 1
+
+
+def test_attachment_breakdown_mixed_full_corpus(tmp_path, monkeypatch):
+    """Replicates the user's live 'Claude attachment test note': 9
+    attachments across 4 destructive buckets + 1 table."""
+    _attachment_breakdown_fixture(tmp_path, monkeypatch, 10, [
+        ("com.apple.notes.table", None, False),
+        ("com.apple.m4a-audio", None, False),
+        ("public.mpeg-4-audio", None, False),
+        ("public.png", None, False),
+        ("public.heic", None, False),
+        ("public.svg-image", None, False),
+        ("com.apple.paper", None, False),
+        ("public.jpeg", None, False),
+        ("com.apple.notes.gallery", None, False),
+    ])
+    out = db.attachment_breakdown(10)
+    assert out["image"]["count"] == 4  # jpeg/png/heic/svg
+    assert out["sketch"]["count"] == 1  # paper
+    assert out["audio"]["count"] == 2  # m4a + mpeg-4
+    assert out["scan"]["count"] == 1  # gallery
+    assert out["table"]["count"] == 1
+    assert out["file"]["count"] == 0  # no unknown UTIs in this set
+    assert db.destructive_attachment_count(10) == 8
+    assert db.attachment_count(10) == 9
+
+
+def test_attachment_breakdown_filenames_deduped(tmp_path, monkeypatch):
+    """Duplicate filenames across rows collapse — list_failed_chunk_ids
+    style dedup. NULL filenames drop out."""
+    _attachment_breakdown_fixture(tmp_path, monkeypatch, 10, [
+        ("public.jpeg", "photo.jpg", False),
+        ("public.jpeg", "photo.jpg", False),
+        ("public.png", None, False),  # NULL filename — must not crash, must not appear
+    ])
+    out = db.attachment_breakdown(10)
+    assert out["image"]["count"] == 3
+    assert out["image"]["filenames"] == ["photo.jpg"]
+    # png with NULL filename doesn't add an empty string.
+    assert "" not in out["image"]["filenames"]
+
+
+def test_attachment_breakdown_z_ent_9_inline_excluded(tmp_path, monkeypatch):
+    """Z_ENT=9 (inline hashtag/mention) rows must not appear in the count."""
+    extra = """
+    INSERT INTO ZICCLOUDSYNCINGOBJECT (Z_PK, Z_ENT, ZNOTE, ZTYPEUTI)
+    VALUES (200, 9, 10, 'com.apple.notes.inlinetextattachment.hashtag');
+    INSERT INTO ZICCLOUDSYNCINGOBJECT (Z_PK, Z_ENT, ZNOTE, ZTYPEUTI)
+    VALUES (201, 5, 10, 'public.jpeg');
+    """
+    db_path = tmp_path / "NoteStore_z9.sqlite"
+    _build_db(db_path, extra_sql=extra)
+    _patch_notestore(monkeypatch, db_path)
+    out = db.attachment_breakdown(10)
+    assert out["image"]["count"] == 1  # the jpeg
+    assert sum(b["count"] for b in out.values()) == 1  # only one row total
+    assert db.attachment_count(10) == 1  # raw count agrees
 
 
 # ---------------------------------------------------------------------------

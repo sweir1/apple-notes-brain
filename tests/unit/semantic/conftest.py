@@ -82,6 +82,10 @@ class FakeEmbedder:
     def dispose(self) -> None:
         self.dispose_count += 1
 
+    def set_metadata(self, meta) -> None:
+        """Phase δ Protocol member. Stored for inspection in tests that care."""
+        self.metadata = meta
+
 
 @pytest.fixture
 def fake_embedder() -> FakeEmbedder:

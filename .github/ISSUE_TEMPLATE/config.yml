@@ -1,0 +1,11 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Troubleshooting guide
+    url: https://sweir1.github.io/apple-notes-brain/troubleshooting/
+    about: Full Disk Access, Automation permission, attachment-destructive writes, locked notes, cache staleness, FTS availability, and more.
+  - name: MCP client install guide
+    url: https://sweir1.github.io/apple-notes-brain/install-clients/
+    about: Exact config shapes for Claude Desktop, Claude Code, Cursor, Continue, and others.
+  - name: macOS walkthrough (non-technical)
+    url: https://sweir1.github.io/apple-notes-brain/install-mac-nontechnical/
+    about: Front-to-back install on macOS including the install script, Full Disk Access, and the Automation permission prompt.

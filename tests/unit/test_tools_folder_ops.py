@@ -228,7 +228,14 @@ class TestDeleteFolderNonCascade:
         assert out.action == "deleted"
         assert out.id == "f99"
         # Tombstone applied so list_folders hides it immediately
-        mock_tomb.assert_called_once_with(99)
+        # v1.1 Phase 4 — tombstone_folder is called with kwargs
+        # (parent_pk, name, zid) so CloudKit-reborn rows with the same
+        # name+parent are still hidden.
+        assert mock_tomb.call_count == 1
+        call_args = mock_tomb.call_args
+        assert call_args.args == (99,)
+        assert call_args.kwargs.get("name") is not None
+        assert call_args.kwargs.get("zid") == "zid-99"
 
     def test_non_empty_no_flag_raises(self):
         patches = self._common()
@@ -357,4 +364,106 @@ class TestDeleteFolderNonCascade:
             finally:
                 self._stop(patches)
         # Verify tombstone applied with correct pk
-        mock_tomb.assert_called_once_with(99)
+        # v1.1 Phase 4 — tombstone_folder is called with kwargs
+        # (parent_pk, name, zid) so CloudKit-reborn rows with the same
+        # name+parent are still hidden.
+        assert mock_tomb.call_count == 1
+        call_args = mock_tomb.call_args
+        assert call_args.args == (99,)
+        assert call_args.kwargs.get("name") is not None
+        assert call_args.kwargs.get("zid") == "zid-99"
+
+
+# ---------------------------------------------------------------------------
+# v1.1 Part 4 Phase 4 — CloudKit reborn-folder auto-retry
+# ---------------------------------------------------------------------------
+
+class TestCloudKitReappearanceRetry:
+    """Tests for `_retry_delete_on_reappearance`. We mock list_folders +
+    folder_zid_by_pk to simulate the scenario described in Apple Discussions
+    #7647836: a folder is deleted, then CloudKit re-syncs the same name +
+    parent back into SQLite as a new Z_PK within a few seconds."""
+
+    def test_retry_skips_when_no_reborn_row(self, monkeypatch):
+        """After delete + tombstone, list_folders returns empty -> no retry."""
+        monkeypatch.setattr("apple_notes_brain.tools.time.sleep", lambda *_: None)
+        with patch("apple_notes_brain.sqlite_reader.list_folders", return_value=[]), \
+             patch("apple_notes_brain.tools._attempt_folder_delete") as mock_delete:
+            from apple_notes_brain import tools as _tools
+            _tools._retry_delete_on_reappearance(
+                folder_name="MyFolder", parent_pk=4, folder_path_for_msg="MyFolder",
+                deleted_pk=99, deleted_zid="zid-old",
+            )
+        mock_delete.assert_not_called()
+
+    def test_retry_skips_when_only_the_deleted_pk_is_present(self, monkeypatch):
+        """list_folders still showing the original deleted PK (SQLite-lag)
+        is NOT a reborn row -- skip retry."""
+        monkeypatch.setattr("apple_notes_brain.tools.time.sleep", lambda *_: None)
+        rows = [{"id": "f99", "name": "MyFolder", "parent_pk": 4}]
+        with patch("apple_notes_brain.sqlite_reader.list_folders", return_value=rows), \
+             patch("apple_notes_brain.tools._attempt_folder_delete") as mock_delete:
+            from apple_notes_brain import tools as _tools
+            _tools._retry_delete_on_reappearance(
+                folder_name="MyFolder", parent_pk=4, folder_path_for_msg="MyFolder",
+                deleted_pk=99, deleted_zid="zid-old",
+            )
+        mock_delete.assert_not_called()
+
+    def test_retry_fires_on_new_pk_with_same_name(self, monkeypatch):
+        """Folder reborn as PK=105 (different) with same name+parent ->
+        re-issue delete."""
+        monkeypatch.setattr("apple_notes_brain.tools.time.sleep", lambda *_: None)
+        responses = iter([
+            [{"id": "f105", "name": "MyFolder", "parent_pk": 4}],
+            [],
+        ])
+        with patch("apple_notes_brain.sqlite_reader.list_folders",
+                   side_effect=lambda *a, **k: next(responses)), \
+             patch("apple_notes_brain.sqlite_reader.folder_zid_by_pk",
+                   return_value="zid-new"), \
+             patch("apple_notes_brain.tools._attempt_folder_delete",
+                   return_value=(True, None)) as mock_delete, \
+             patch("apple_notes_brain.cache.tombstone_folder") as mock_tomb:
+            from apple_notes_brain import tools as _tools
+            _tools._retry_delete_on_reappearance(
+                folder_name="MyFolder", parent_pk=4, folder_path_for_msg="MyFolder",
+                deleted_pk=99, deleted_zid="zid-old",
+            )
+        mock_delete.assert_called_once()
+        mock_tomb.assert_called_once()
+        assert mock_tomb.call_args.args == (105,)
+        assert mock_tomb.call_args.kwargs.get("zid") == "zid-new"
+
+    def test_retry_gives_up_after_max_attempts(self, monkeypatch):
+        """Folder keeps reappearing -- bail after 3 attempts, no raise."""
+        monkeypatch.setattr("apple_notes_brain.tools.time.sleep", lambda *_: None)
+        rows = [{"id": "f105", "name": "MyFolder", "parent_pk": 4}]
+        with patch("apple_notes_brain.sqlite_reader.list_folders", return_value=rows), \
+             patch("apple_notes_brain.sqlite_reader.folder_zid_by_pk",
+                   return_value="zid-new"), \
+             patch("apple_notes_brain.tools._attempt_folder_delete",
+                   return_value=(False, "still there")) as mock_delete, \
+             patch("apple_notes_brain.cache.tombstone_folder"):
+            from apple_notes_brain import tools as _tools
+            _tools._retry_delete_on_reappearance(
+                folder_name="MyFolder", parent_pk=4, folder_path_for_msg="MyFolder",
+                deleted_pk=99, deleted_zid="zid-old",
+            )
+        assert mock_delete.call_count == 3
+
+    def test_retry_skips_when_reborn_zid_matches_deleted_zid(self, monkeypatch):
+        """Defensive: if folder_zid_by_pk returns the SAME zid as the
+        deleted one, that's somehow the same row -- skip retry."""
+        monkeypatch.setattr("apple_notes_brain.tools.time.sleep", lambda *_: None)
+        rows = [{"id": "f105", "name": "MyFolder", "parent_pk": 4}]
+        with patch("apple_notes_brain.sqlite_reader.list_folders", return_value=rows), \
+             patch("apple_notes_brain.sqlite_reader.folder_zid_by_pk",
+                   return_value="zid-old"), \
+             patch("apple_notes_brain.tools._attempt_folder_delete") as mock_delete:
+            from apple_notes_brain import tools as _tools
+            _tools._retry_delete_on_reappearance(
+                folder_name="MyFolder", parent_pk=4, folder_path_for_msg="MyFolder",
+                deleted_pk=99, deleted_zid="zid-old",
+            )
+        mock_delete.assert_not_called()

@@ -46,7 +46,11 @@ CREATE TABLE ZICCLOUDSYNCINGOBJECT (
     ZSERVERRECORDDATA BLOB,
     ZMERGEABLEDATA1 BLOB,
     ZCRYPTOINITIALIZATIONVECTOR BLOB,
-    ZLOCKEDNOTESMODE INTEGER
+    ZLOCKEDNOTESMODE INTEGER,
+    -- Attachment metadata (Z_ENT=5 rows). NULL on note/folder/account rows.
+    ZTYPEUTI TEXT,
+    ZFILENAME TEXT,
+    ZFALLBACKPDFGENERATION BLOB    -- non-null marks a scanned-doc attachment
 );
 
 -- Account row (Z_ENT=14). ZNAME is the display name used by _account_name_column.

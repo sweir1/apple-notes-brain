@@ -136,8 +136,11 @@ def test_hybrid_search_returns_search_page(state):
 
 def test_hybrid_search_finds_lexical_match(state):
     out = tools_semantic.hybrid_search("yoghurt", limit=5)
-    ids = [r.id for r in out.results]
-    assert "zid-berry" in ids
+    # Phase ι: `id` is now the short `pN` form; ZIDENTIFIER lives on
+    # `z_identifier`. We match against z_identifier here so the test
+    # documents the contract the lexical match relies on.
+    zids = [r.z_identifier for r in out.results]
+    assert "zid-berry" in zids
 
 
 def test_hybrid_search_attaches_both_scores(state):
@@ -192,7 +195,8 @@ def test_status_returns_keys(state):
     status = tools_semantic.semantic_index_status()
     expected_keys = {
         "schema_version", "total_nodes", "total_chunks",
-        "total_failed_chunks", "chunks_vec_dim", "last_indexed_at",
+        "total_failed_chunks", "locked_notes", "failed_chunks_by_reason",
+        "chunks_vec_dim", "last_indexed_at",
         "vec_version", "embedder_provider", "embedder_model",
         "embedder_dim", "onnx_providers", "data_dir", "db_path",
     }
@@ -258,3 +262,541 @@ def test_note_summary_back_compat_no_semantic_fields():
     assert n.lexical_score is None
     assert n.chunk_excerpt is None
     assert n.chunk_heading is None
+    assert n.z_identifier is None
+    assert n.fused_score is None
+
+
+# ---------------------------------------------------------------------------
+# Phase ι — note-id normalisation
+# ---------------------------------------------------------------------------
+
+def test_id_is_short_form_pn(state):
+    """Phase ι: `id` is now the short `p<z_pk>` form (matches the lexical
+    `search_notes` tool), not the ZIDENTIFIER UUID."""
+    out = tools_semantic.semantic_search("apple pie", limit=5)
+    assert out.results, "fixture should return at least one hit"
+    for r in out.results:
+        assert r.id.startswith("p"), f"expected pN form, got {r.id!r}"
+        # The rest is digits (an integer z_pk).
+        assert r.id[1:].isdigit(), f"expected digits after 'p', got {r.id!r}"
+
+
+def test_id_preserves_zidentifier_on_z_identifier_field(state):
+    """The original ZIDENTIFIER is still available on `z_identifier` so
+    callers can correlate across sessions / round-trip into the Notes
+    storage layer."""
+    out = tools_semantic.semantic_search("apple pie", limit=5)
+    assert out.results
+    for r in out.results:
+        assert r.z_identifier is not None
+        assert r.z_identifier.startswith("zid-")
+
+
+def test_id_falls_back_to_zidentifier_when_node_missing(state):
+    """If the nodes table doesn't have a row for the ZIDENTIFIER (race
+    between search and indexer-driven delete, or test injection), the
+    `id` field falls back to the raw ZIDENTIFIER rather than crashing."""
+
+    class FakeHit:
+        note_id = "zid-not-in-store"
+        title = "Phantom"
+        excerpt = None
+        semantic_score = 0.5
+        lexical_score = None
+        chunk_excerpt = None
+        chunk_heading = None
+
+    summary = tools_semantic._to_note_summary(state, FakeHit())
+    assert summary.id == "zid-not-in-store"
+    assert summary.z_identifier == "zid-not-in-store"
+
+
+def test_id_falls_back_to_zidentifier_when_get_node_raises(state, monkeypatch):
+    """A misbehaving store.get_node mustn't crash the response — fall back
+    to the raw ZIDENTIFIER."""
+    from apple_notes_brain.semantic import store as store_mod
+
+    def boom(*args, **kwargs):
+        raise RuntimeError("store down")
+
+    monkeypatch.setattr(store_mod, "get_node", boom)
+
+    class FakeHit:
+        note_id = "zid-apple"
+        title = "Apple"
+        excerpt = None
+        semantic_score = 0.5
+        lexical_score = None
+        chunk_excerpt = None
+        chunk_heading = None
+
+    summary = tools_semantic._to_note_summary(state, FakeHit())
+    assert summary.id == "zid-apple"
+    assert summary.z_identifier == "zid-apple"
+
+
+# ---------------------------------------------------------------------------
+# Phase ι — empty-index hint
+# ---------------------------------------------------------------------------
+
+@pytest.fixture
+def empty_state(tmp_path: Path, monkeypatch):
+    """A SemanticState with no indexed notes — so total_chunks == 0."""
+    monkeypatch.setenv("APPLE_NOTES_BRAIN_DATA_DIR", str(tmp_path))
+    cfg = load_config()
+    conn = open_db(cfg.db_path)
+    emb = FakeEmbedder(dim=64)
+    emb.init()
+    indexer = IndexPipeline(
+        conn, emb,
+        IndexerConfig(chunker_config=ChunkerConfig(
+            chunk_size=200, min_chunk_chars=10, heading_split_depth=4,
+        )),
+    )
+    indexer.prepare()  # creates schema + vec table; doesn't index any notes
+    src = FakeNotesSource()  # empty source
+    search = Search(conn, emb)
+    s = tools_semantic.SemanticState(
+        conn=conn, embedder=emb, indexer=indexer,
+        search=search, source=src, config_snapshot=cfg,
+    )
+    tools_semantic.set_state_for_tests(s)
+    yield s
+    tools_semantic.reset_state_for_tests()
+
+
+def test_semantic_search_empty_index_returns_hint(empty_state):
+    out = tools_semantic.semantic_search("anything", limit=5)
+    assert isinstance(out, SearchPage)
+    assert out.results == []
+    assert out.hint is not None
+    assert "empty" in out.hint.lower()
+    assert "reindex_semantic" in out.hint
+    assert "semantic_index_status" in out.hint
+
+
+def test_hybrid_search_empty_index_returns_hint(empty_state):
+    out = tools_semantic.hybrid_search("anything", limit=5)
+    assert isinstance(out, SearchPage)
+    assert out.results == []
+    assert out.hint is not None
+    assert "empty" in out.hint.lower()
+
+
+def test_semantic_search_empty_results_populated_index_no_hint(state):
+    """Index has rows; a query with zero matches must NOT carry the hint
+    (the hint is reserved for the empty-index case, not zero-match queries)."""
+    out = tools_semantic.semantic_search(
+        "xyzpdq-no-such-token-anywhere-1234567890", limit=5
+    )
+    # The fake embedder gives high-dim noise for any input so results
+    # are NOT necessarily empty. What we assert is the *contract*: if
+    # the index is populated the hint stays None.
+    assert out.hint is None
+
+
+def test_semantic_search_populated_index_no_hint_when_results_present(state):
+    """The hint must NOT appear when results are present."""
+    out = tools_semantic.semantic_search("apple", limit=5)
+    if out.results:
+        assert out.hint is None
+
+
+def test_empty_query_no_hint(state):
+    """Empty query short-circuits without ever touching the store —
+    no hint is set."""
+    out = tools_semantic.semantic_search("", limit=5)
+    assert out.hint is None
+    out2 = tools_semantic.hybrid_search("", limit=5)
+    assert out2.hint is None
+
+
+def test_empty_index_hint_helper_returns_none_on_status_failure(empty_state, monkeypatch):
+    """If store_index_status raises, the helper returns None rather than
+    propagating — the hint is advisory, not load-bearing."""
+    from apple_notes_brain import tools_semantic as ts_mod
+
+    def boom(*args, **kwargs):
+        raise RuntimeError("status down")
+
+    monkeypatch.setattr(ts_mod, "store_index_status", boom)
+    assert ts_mod._empty_index_hint(empty_state) is None
+
+
+def test_empty_index_hint_text_constant_format():
+    """The hint constant exists and mentions the two tools the caller
+    needs to know about."""
+    from apple_notes_brain.tools_semantic import _EMPTY_INDEX_HINT
+    assert "reindex_semantic" in _EMPTY_INDEX_HINT
+    assert "semantic_index_status" in _EMPTY_INDEX_HINT
+
+
+def test_search_page_hint_field_optional_and_defaults_none():
+    """Back-compat: SearchPage without hint still constructs."""
+    sp = SearchPage(
+        results=[], returned=0, has_more=False,
+        next_cursor=None, total_estimate=None,
+    )
+    assert sp.hint is None
+
+
+def test_search_page_hint_field_accepted():
+    sp = SearchPage(
+        results=[], returned=0, has_more=False,
+        next_cursor=None, total_estimate=None, hint="custom advisory",
+    )
+    assert sp.hint == "custom advisory"
+
+
+# ---------------------------------------------------------------------------
+# v1.1 reindex force=True clears failed_chunks
+# ---------------------------------------------------------------------------
+
+def test_reindex_force_clears_failed_chunks(state):
+    """force=True should drop every real-failure row in failed_chunks at the start.
+
+    Locked-row deletes are NOT counted in `prior_failures_cleared` —
+    locked notes aren't failures, just expected placeholders that
+    re-create on the next pass.
+    """
+    from apple_notes_brain.semantic.store import record_failed_chunk, count_failed_chunks
+
+    # Seed 5 real failures (too-long) and 2 locked placeholders.
+    for i in range(5):
+        record_failed_chunk(
+            state.conn,
+            chunk_id=f"zid-toolong-{i}#0",
+            node_id=f"zid-toolong-{i}",
+            reason="too-long",
+            error_message="exceeds capacity",
+        )
+    for i in range(2):
+        record_failed_chunk(
+            state.conn,
+            chunk_id=f"zid-locked-{i}#0",
+            node_id=f"zid-locked-{i}",
+            reason="locked",
+            error_message="password-protected",
+        )
+    assert count_failed_chunks(state.conn) == 7
+
+    stats = tools_semantic.reindex_semantic(force=True)
+    # Only the 5 real failures count toward "prior_failures_cleared".
+    assert stats["prior_failures_cleared"] == 5
+    # After the pass, all rows are gone (the indexed corpus has no
+    # locked notes either, so the locked rows don't re-create).
+    assert count_failed_chunks(state.conn) == 0
+
+
+def test_reindex_default_does_not_clear_failed_chunks(state):
+    """force=False (default) must leave the failed_chunks table alone."""
+    from apple_notes_brain.semantic.store import record_failed_chunk, count_failed_chunks
+
+    record_failed_chunk(
+        state.conn,
+        chunk_id="zid-stale#0",
+        node_id="zid-stale",
+        reason="too-long",
+        error_message="stale failure",
+    )
+    assert count_failed_chunks(state.conn) == 1
+
+    stats = tools_semantic.reindex_semantic()  # force defaults to False
+    assert stats.get("prior_failures_cleared", 0) == 0
+    # Row still present.
+    assert count_failed_chunks(state.conn) == 1
+
+
+def test_reindex_force_with_empty_table_returns_zero_cleared(state):
+    from apple_notes_brain.semantic.store import count_failed_chunks
+
+    assert count_failed_chunks(state.conn) == 0
+    stats = tools_semantic.reindex_semantic(force=True)
+    assert stats["prior_failures_cleared"] == 0
+
+
+def test_reindex_force_then_status_shows_zero_failed(state):
+    """End-to-end: stale real failures, force-reindex, status shows clean."""
+    from apple_notes_brain.semantic.store import record_failed_chunk
+
+    for i in range(3):
+        record_failed_chunk(
+            state.conn,
+            chunk_id=f"chunk-{i}", node_id=f"node-{i}",
+            reason="too-long", error_message="x",
+        )
+    status_before = tools_semantic.semantic_index_status()
+    assert status_before["total_failed_chunks"] == 3
+    assert status_before["failed_chunks_by_reason"].get("too-long") == 3
+
+    tools_semantic.reindex_semantic(force=True)
+    status_after = tools_semantic.semantic_index_status()
+    assert status_after["total_failed_chunks"] == 0
+    assert status_after["failed_chunk_ids"] == []
+
+
+# ---------------------------------------------------------------------------
+# v1.1 Part 4 Phase 1 — locked notes are NOT failures
+# ---------------------------------------------------------------------------
+
+def test_locked_notes_excluded_from_total_failed_chunks(state):
+    """Locked-note placeholders sit under `locked_notes`, not
+    `total_failed_chunks`."""
+    from apple_notes_brain.semantic.store import record_failed_chunk
+
+    for i in range(9):
+        record_failed_chunk(
+            state.conn,
+            chunk_id=f"zid-locked-{i}#0",
+            node_id=f"zid-locked-{i}",
+            reason="locked",
+            error_message="password-protected",
+        )
+    status = tools_semantic.semantic_index_status()
+    assert status["locked_notes"] == 9
+    assert status["total_failed_chunks"] == 0
+    # Locked rows do NOT appear in the breakdown either.
+    assert "locked" not in status["failed_chunks_by_reason"]
+    # And their IDs are excluded from the surfaced failed_chunk_ids.
+    assert status["failed_chunk_ids"] == []
+
+
+def test_failed_chunks_by_reason_breakdown(state):
+    """Mixed scenario: 5 locked + 1 too-long + 1 embed-error →
+    locked_notes=5, total_failed_chunks=2."""
+    from apple_notes_brain.semantic.store import record_failed_chunk
+
+    for i in range(5):
+        record_failed_chunk(
+            state.conn,
+            chunk_id=f"locked-{i}",
+            node_id=f"node-locked-{i}",
+            reason="locked",
+            error_message="x",
+        )
+    record_failed_chunk(
+        state.conn, chunk_id="toolong-0", node_id="node-tl-0",
+        reason="too-long", error_message="exceeded budget",
+    )
+    record_failed_chunk(
+        state.conn, chunk_id="embed-0", node_id="node-em-0",
+        reason="embed-error", error_message="onnx threw",
+    )
+    status = tools_semantic.semantic_index_status()
+    assert status["locked_notes"] == 5
+    assert status["total_failed_chunks"] == 2
+    assert status["failed_chunks_by_reason"] == {
+        "too-long": 1, "embed-error": 1,
+    }
+    # failed_chunk_ids surfaces only the 2 real failures (order: most-recent first).
+    assert set(status["failed_chunk_ids"]) == {"toolong-0", "embed-0"}
+
+
+def test_force_reindex_clears_locked_but_doesnt_count_them(state):
+    """force=True deletes locked rows too (so the next pass can
+    re-validate) but they don't count toward prior_failures_cleared."""
+    from apple_notes_brain.semantic.store import record_failed_chunk, count_failed_chunks
+
+    for i in range(4):
+        record_failed_chunk(
+            state.conn,
+            chunk_id=f"locked-{i}", node_id=f"n-{i}",
+            reason="locked", error_message="x",
+        )
+    assert count_failed_chunks(state.conn) == 4
+
+    stats = tools_semantic.reindex_semantic(force=True)
+    # 0 real failures cleared (everything was locked).
+    assert stats["prior_failures_cleared"] == 0
+    # All rows gone.
+    assert count_failed_chunks(state.conn) == 0
+
+
+# ---------------------------------------------------------------------------
+# semantic_index_status — new fields
+# ---------------------------------------------------------------------------
+
+def test_status_includes_embedder_warm(state):
+    """The state singleton was injected by the fixture, so
+    embedder_warm is True on every call from inside this test."""
+    status = tools_semantic.semantic_index_status()
+    assert "embedder_warm" in status
+    assert status["embedder_warm"] is True
+
+
+def test_status_includes_failed_chunk_ids(state):
+    status = tools_semantic.semantic_index_status()
+    assert "failed_chunk_ids" in status
+    assert isinstance(status["failed_chunk_ids"], list)
+
+
+def test_status_failed_chunk_ids_truncated_at_50():
+    """When >50 failures exist, the list is capped and the last entry
+    is suffixed with ' (truncated)'."""
+    # Build a fresh state isolated from the shared fixture (which
+    # currently injects 0 failures).
+    from pathlib import Path
+    import tempfile
+
+    from apple_notes_brain.semantic.config import load_config
+    from apple_notes_brain.semantic.indexer import IndexPipeline, IndexerConfig
+    from apple_notes_brain.semantic.search import Search
+    from apple_notes_brain.semantic.source import FakeNotesSource
+    from apple_notes_brain.semantic.store import open_db, record_failed_chunk
+    from apple_notes_brain.semantic.types import ChunkerConfig
+
+    with tempfile.TemporaryDirectory() as td:
+        import os
+
+        os.environ["APPLE_NOTES_BRAIN_DATA_DIR"] = td
+        try:
+            cfg = load_config()
+            conn = open_db(cfg.db_path)
+            emb = FakeEmbedder(dim=64)
+            emb.init()
+            indexer = IndexPipeline(
+                conn, emb, IndexerConfig(chunker_config=ChunkerConfig(
+                    chunk_size=200, min_chunk_chars=10,
+                )),
+            )
+            # Build chunks_vec table by running an empty index pass.
+            indexer.prepare()
+            for i in range(60):
+                record_failed_chunk(
+                    conn, chunk_id=f"chunk-{i:03d}",
+                    node_id=f"node-{i:03d}",
+                    reason="too-long", error_message="x",
+                )
+            search = Search(conn, emb)
+            src = FakeNotesSource()
+            s = tools_semantic.SemanticState(
+                conn=conn, embedder=emb, indexer=indexer,
+                search=search, source=src, config_snapshot=cfg,
+            )
+            tools_semantic.set_state_for_tests(s)
+
+            status = tools_semantic.semantic_index_status()
+            assert status["total_failed_chunks"] == 60
+            assert len(status["failed_chunk_ids"]) == 50
+            assert status["failed_chunk_ids"][-1].endswith(" (truncated)")
+        finally:
+            tools_semantic.reset_state_for_tests()
+            os.environ.pop("APPLE_NOTES_BRAIN_DATA_DIR", None)
+
+
+def test_status_failed_chunk_ids_empty_when_none_recorded(state):
+    status = tools_semantic.semantic_index_status()
+    assert status["failed_chunk_ids"] == []
+
+
+def test_status_embedder_warm_false_before_first_state_construction(monkeypatch, tmp_path):
+    """The first call to semantic_index_status (or any tool) constructs
+    the state. We exercise that by resetting the singleton FIRST and
+    then asserting embedder_warm reports False on the construction call."""
+    # Reset shared singleton.
+    tools_semantic.reset_state_for_tests()
+
+    monkeypatch.setenv("APPLE_NOTES_BRAIN_DATA_DIR", str(tmp_path))
+    # Mock create_embedder to return a FakeEmbedder so we don't trigger
+    # an ONNX model download in CI.
+    from apple_notes_brain.semantic import embedder as embedder_module
+    from apple_notes_brain import tools_semantic as ts_module
+
+    def _fake_factory(cfg):
+        e = FakeEmbedder(dim=64)
+        return e
+
+    monkeypatch.setattr(ts_module, "create_embedder", _fake_factory)
+
+    # Now call status — this is the FIRST tool call, so embedder_warm
+    # should report False (the snapshot happens before get_state runs).
+    status = tools_semantic.semantic_index_status()
+    assert status["embedder_warm"] is False
+    # The cached state is now ready; a second call reports True.
+    status2 = tools_semantic.semantic_index_status()
+    assert status2["embedder_warm"] is True
+
+    tools_semantic.reset_state_for_tests()
+
+
+# ---------------------------------------------------------------------------
+# Trash plumbing — semantic_search / hybrid_search include_trash
+# ---------------------------------------------------------------------------
+
+def test_semantic_search_default_excludes_trash(state):
+    """End-to-end: a previously-indexed note that's now in trash should
+    NOT appear in default semantic_search output. We force the note
+    into the index via include_trash=True, then verify the tool drops it."""
+    from apple_notes_brain.semantic.source import NoteRecord
+
+    # Add a trash note via include_trash=True on the indexer to bypass
+    # the index-time filter.
+    trash_rec = NoteRecord(
+        z_identifier="zid-tomb", z_pk=999, title="Tombstone",
+        folder="Recently Deleted", modified_at=1700000000,
+        locked=False, pinned=False,
+    )
+    state.source.add(trash_rec, "Pasta with garlic, olive oil — old recipe.")
+    state.indexer.index_all(state.source, include_trash=True)
+    # Default semantic_search must NOT return the trash hit.
+    out = tools_semantic.semantic_search("pasta garlic olive", limit=10)
+    ids = [r.id for r in out.results]
+    assert "zid-tomb" not in ids
+
+
+def test_semantic_search_does_not_accept_include_trash_kwarg(state):
+    """v1.1 Phase 5: the include_trash param was removed from the
+    semantic API surface. Calling with the kwarg must error rather
+    than silently include trash."""
+    import inspect
+
+    sig = inspect.signature(tools_semantic.semantic_search)
+    assert "include_trash" not in sig.parameters
+    # And actually calling with it raises TypeError.
+    with pytest.raises(TypeError):
+        tools_semantic.semantic_search("x", include_trash=True)  # type: ignore[call-arg]
+
+
+def test_hybrid_search_does_not_accept_include_trash_kwarg(state):
+    """v1.1 Phase 5: same removal applies to hybrid_search."""
+    import inspect
+
+    sig = inspect.signature(tools_semantic.hybrid_search)
+    assert "include_trash" not in sig.parameters
+    with pytest.raises(TypeError):
+        tools_semantic.hybrid_search("x", include_trash=True)  # type: ignore[call-arg]
+
+
+def test_hybrid_search_default_excludes_trash(state):
+    from apple_notes_brain.semantic.source import NoteRecord
+
+    trash_rec = NoteRecord(
+        z_identifier="zid-tomb", z_pk=999, title="Tombstone",
+        folder="Recently Deleted", modified_at=1700000000,
+        locked=False, pinned=False,
+    )
+    state.source.add(trash_rec, "Pasta with garlic, olive oil — old recipe.")
+    state.indexer.index_all(state.source, include_trash=True)
+    out = tools_semantic.hybrid_search("pasta garlic olive", limit=10)
+    ids = [r.id for r in out.results]
+    assert "zid-tomb" not in ids
+
+
+def test_hybrid_search_results_carry_fused_score(state):
+    """hybrid_search results expose fused_score on the NoteSummary."""
+    out = tools_semantic.hybrid_search("pasta", limit=5)
+    assert isinstance(out, SearchPage)
+    assert any(r.fused_score is not None for r in out.results)
+
+
+def test_hybrid_search_results_sorted_by_fused_score(state):
+    out = tools_semantic.hybrid_search("pasta", limit=10)
+    fused = [r.fused_score or 0.0 for r in out.results]
+    assert fused == sorted(fused, reverse=True)
+
+
+def test_semantic_search_match_count_is_one(state):
+    """Per the v1.1 contract change, semantic hits set match_count=1."""
+    out = tools_semantic.semantic_search("apple", limit=5)
+    for r in out.results:
+        assert r.match_count == 1

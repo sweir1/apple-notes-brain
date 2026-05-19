@@ -25,6 +25,8 @@ from . import sqlite_reader as db
 from .html_text import count_matches, html_to_text, snippets
 from .markdown import html_to_markdown, markdown_to_html
 from .schemas import (
+    AttachmentBucket,
+    AttachmentSummary,
     Folder,
     ListPage,
     MutationResult,
@@ -212,6 +214,33 @@ def _iso_to_core_data_epoch(iso: str | None) -> float | None:
 # Internal helpers
 # ---------------------------------------------------------------------------
 
+def _build_attachment_summary(pk: int) -> AttachmentSummary:
+    """Pull `attachment_breakdown` from the SQL layer and wrap it in the
+    `AttachmentSummary` schema with the destructive/reconstructable
+    totals computed."""
+    raw = db.attachment_breakdown(pk)
+    by_type: dict[str, AttachmentBucket] = {}
+    destructive = 0
+    reconstructable = 0
+    for bucket_name, bucket in raw.items():
+        b = AttachmentBucket(
+            count=bucket["count"],
+            destructive=bucket["destructive"],
+            utis=bucket["utis"],
+            filenames=bucket["filenames"],
+        )
+        by_type[bucket_name] = b
+        if b.destructive:
+            destructive += b.count
+        else:
+            reconstructable += b.count
+    return AttachmentSummary(
+        total_destructive=destructive,
+        total_reconstructable=reconstructable,
+        by_type=by_type,
+    )
+
+
 def _fmt_time(epoch: float) -> str:
     if not epoch:
         return ""
@@ -288,7 +317,8 @@ def _wait_until_as_addressable(uri: str, kind: str, max_wait_s: float = MOC_COMM
     sleep_s = 0.05
     while time.monotonic() < deadline:
         try:
-            aps.run(probe)
+            # Read-only probe — no excuse to hang for the default 30s budget.
+            aps.run(probe, timeout=aps.READ_ONLY_TIMEOUT)
             return True  # AS can now address the new object
         except aps.AppleScriptError as exc:
             if "invalid index" not in str(exc).lower():
@@ -428,14 +458,120 @@ def _folder_name_map(folders: list[dict]) -> dict[int, str]:
     return out
 
 
+_BLEACH_ALLOWED_TAGS = frozenset({
+    "p", "br", "b", "i", "u", "strong", "em", "span", "div",
+    "ul", "ol", "li",
+    "h1", "h2", "h3", "h4", "h5", "h6",
+    "blockquote", "code", "pre", "a", "img",
+    "table", "thead", "tbody", "tr", "th", "td",
+})
+_BLEACH_ALLOWED_ATTRS = {
+    "a": ["href"],
+    "img": ["src", "alt"],
+    "span": ["style"],
+    "div": ["style"],
+}
+# Hard upper bound on HTML input size. AppleScript's `set body of note` has
+# its own (poorly-documented) cap around 1MB; html5lib's parser is linear
+# but the constant is large enough that a 1MB blob takes seconds. Truncating
+# before sanitise prevents the wedge regardless of payload shape — and notes
+# longer than this aren't reasonable anyway.
+_MAX_HTML_INPUT_BYTES = 256_000
+# Tags whose entire content (not just the tag itself) must be discarded.
+# bleach's `strip=True` removes the tag wrapper but keeps text content, so
+# `<script>alert(1)</script>` would leak `alert(1)` as plain text. We
+# pre-decompose these via bs4 before invoking bleach.
+_NUKE_CONTENT_TAGS = ("script", "style", "iframe", "noscript", "object",
+                      "embed", "form", "svg", "math")
+
+
+def _sanitize_html_input(html: str) -> str:
+    """Sanitise user-supplied HTML BEFORE handing it to AppleScript.
+
+    Defence against:
+      - <script>, <iframe>, <style> with on* handlers, javascript: URIs,
+        SVG event triggers — would either execute in the Notes WebView or
+        wedge AppleScript's HTML parser on adversarial input.
+      - Catastrophic backtracking in our own regex-based normaliser. bleach
+        uses html5lib (a real tokeniser, no regex backtracking) so deeply
+        nested unclosed tags resolve in linear time.
+      - Multi-MB pathological inputs — html5lib is linear but the constant
+        is large, so we cap input size up front.
+
+    Empty result raises ValueError so we don't silently write an empty body
+    (the model's prompt asked us to put something there; signalling failure
+    is better than producing a blank note).
+    """
+    if not html or not html.strip():
+        raise ValueError(
+            "HTML body is empty after stripping whitespace — pass a non-empty body, "
+            "or use format='text' / format='markdown' for plain content."
+        )
+    if len(html) > _MAX_HTML_INPUT_BYTES:
+        raise ValueError(
+            f"HTML body is {len(html)} bytes — exceeds the {_MAX_HTML_INPUT_BYTES}-byte "
+            "limit. Apple Notes itself caps note size; split the content into "
+            "multiple notes or trim before submitting."
+        )
+
+    # Pre-pass: decompose tags whose CONTENTS must also be removed.
+    # bleach.clean(strip=True) drops tag wrappers but keeps text inside, which
+    # would let <script>alert(1)</script> leak `alert(1)` as plain text.
+    try:
+        from bs4 import BeautifulSoup
+        soup = BeautifulSoup(html, "lxml")
+        for tag_name in _NUKE_CONTENT_TAGS:
+            for el in soup.find_all(tag_name):
+                el.decompose()
+        # Also drop HTML comments outright — they can hide script tags from
+        # naive parsers.
+        from bs4 import Comment
+        for c in soup.find_all(string=lambda t: isinstance(t, Comment)):
+            c.extract()
+        pre_cleaned = str(soup)
+    except Exception:
+        # bs4 unavailable or parse failure — proceed with raw input; bleach
+        # still gives us the tag-level safety net.
+        pre_cleaned = html
+
+    try:
+        import bleach
+    except ImportError:  # pragma: no cover — bleach is in core deps
+        # Bleach unavailable — fall back to the legacy bs4-based normaliser
+        # (still safer than passing raw HTML through).
+        from .html_validate import normalize_html
+        return normalize_html(pre_cleaned)
+
+    cleaned = bleach.clean(
+        pre_cleaned,
+        tags=_BLEACH_ALLOWED_TAGS,
+        attributes=_BLEACH_ALLOWED_ATTRS,
+        protocols=["http", "https", "mailto"],  # no javascript:, data:, file:
+        strip=True,
+        strip_comments=True,
+    )
+    if not cleaned or not cleaned.strip():
+        raise ValueError(
+            "HTML body became empty after sanitisation (likely all-disallowed "
+            "tags such as <script>, <iframe>, or empty wrappers). Pass HTML "
+            "containing at least one of: p, div, br, b, i, u, span, ul/ol/li, "
+            "h1-h6, blockquote, code, pre, a, img, table."
+        )
+    return cleaned
+
+
 def _body_to_html(body: str, format: BodyFormat) -> str:
     if not body:
         return ""
     if format == "markdown":
         return markdown_to_html(body)
     if format == "html":
+        # First sanitise (linear-time tokeniser, drops script/event-handlers),
+        # then run through the Apple-Notes-preferred normaliser (tag rewrites
+        # like strong→b, h4→div) so we keep both safety AND fidelity.
+        sanitised = _sanitize_html_input(body)
         from .html_validate import normalize_html
-        return normalize_html(body)
+        return normalize_html(sanitised)
     if format == "text":
         escaped = _htmlmod.escape(body).replace("\n", "<br>")
         return f"<div>{escaped}</div>"
@@ -505,7 +641,18 @@ def _folders_with_overlays(include_counts: bool = False) -> list[dict]:
     rows = db.list_folders(include_counts=include_counts)
     try:
         from . import cache as _cache
-        rows = [r for r in rows if not _cache.is_tombstoned(int(r["id"][1:]))]
+        # Tombstone check uses all three indexes (PK + (parent, name) + zid)
+        # so CloudKit-reconstituted folders that come back with a new Z_PK
+        # are still hidden during the TTL window.
+        rows = [
+            r for r in rows
+            if not _cache.is_tombstoned(
+                int(r["id"][1:]),
+                parent_pk=r.get("parent_pk"),
+                name=r.get("name"),
+                zid=r.get("zid") or r.get("z_identifier"),
+            )
+        ]
         rows = _cache.apply_rename_overlay(rows)
     except Exception:
         pass
@@ -849,6 +996,7 @@ def _get_note_applescript(pk: int, format: BodyFormat) -> NoteDetail:
     body_html = aps.UNIT_SEP.join(parts[4:])
 
     fmap = _folder_name_map(_folders_with_overlays())
+    summary = _build_attachment_summary(pk)
     return NoteDetail(
         id=db.short_id(pk),
         title=meta.get("title") or "",
@@ -858,7 +1006,8 @@ def _get_note_applescript(pk: int, format: BodyFormat) -> NoteDetail:
         format=format,
         pinned=bool(meta.get("pinned")),
         locked=False,
-        attachments=db.attachment_count(pk),
+        attachments=summary.total_destructive,
+        attachments_detail=summary,
         shared=bool(meta.get("shared")),
     )
 
@@ -1042,19 +1191,31 @@ def update_note(
     if not meta:
         raise ValueError(f"note not found: {note_id!r}")
 
-    # SAFETY: AppleScript's `set body of note` silently deletes every attachment
-    # (images, sketches, scans, PDFs) on the note. Refuse unless caller explicitly
-    # acknowledges the loss. Append mode has the same underlying behaviour.
+    # SAFETY: AppleScript's `set body of note` silently deletes every
+    # *destructive* attachment (image/sketch/scan/audio/unknown-file) on the
+    # note. Tables are CRDT widgets — rebuilt from the new HTML/markdown
+    # body — so they DON'T trigger the guard. Refuse unless caller
+    # explicitly acknowledges the loss.
     # Check FIRST (before lock check) so a locked-AND-attachmented note shows
     # the more dangerous attachment warning; otherwise the user could see
     # "locked", unlock-and-retry, and silently lose attachments.
     if not allow_attachment_loss:
-        n_att = db.attachment_count(pk)
-        if n_att > 0:
+        summary = _build_attachment_summary(pk)
+        if summary.total_destructive > 0:
+            # Build a per-bucket detail string so the user/model sees
+            # exactly what types are at risk ("image: 2, sketch: 1").
+            detail = ", ".join(
+                f"{name}: {b.count}"
+                for name, b in summary.by_type.items()
+                if b.destructive and b.count > 0
+            )
             raise ValueError(
-                f"refusing to update note {note_id!r}: it has {n_att} attachment(s) which "
-                "Apple's AppleScript 'body' setter would silently delete. "
-                "Pass allow_attachment_loss=True to override (only after confirming with the user)."
+                f"refusing to update note {note_id!r}: it has "
+                f"{summary.total_destructive} destructive attachment(s) "
+                f"({detail}) which Apple's AppleScript 'body' setter would "
+                "silently delete. Pass allow_attachment_loss=True to override "
+                "(only after confirming with the user). "
+                "Note: tables don't count — they're rebuilt from the new body."
             )
 
     # Lock check AFTER attachment guard. Recoverable: user unlocks, retries.
@@ -1679,16 +1840,107 @@ def _delete_one_folder(
         return  # already gone
 
     folder_name = folder_path_for_msg.split("/")[-1] or folder_path_for_msg
+    # Capture parent PK before delete so the (parent, name) tombstone key
+    # catches CloudKit-reborn rows that come back with a new Z_PK.
+    parent_pk = None
+    try:
+        for f in db.list_folders():
+            if int(f.get("id", "f0")[1:]) == pk:
+                parent_pk = f.get("parent_pk")
+                break
+    except Exception:
+        pass
+
     ok, err = _attempt_folder_delete(folder_zid, pk, folder_name)
     if not ok:
         raise ValueError(err or f"folder {folder_path_for_msg!r} deletion verification failed")
 
     try:
         from . import cache as _cache
-        _cache.tombstone_folder(pk)
+        # Tombstone by (PK, parent+name, zid) — catches CloudKit reborn rows
+        # with a new Z_PK that share the same name + parent.
+        _cache.tombstone_folder(pk, parent_pk=parent_pk, name=folder_name, zid=folder_zid)
         _cache.sync_after_write()
     except Exception:
         pass
+
+    # Auto-retry by path: CloudKit can reconstitute a deleted folder as a
+    # new SQLite row with a fresh Z_PK within ~5s of the delete (per Apple
+    # Discussions #7647836). The tombstone catches the row at the list_folders
+    # layer for the TTL window, but the row IS in SQLite — so a subsequent
+    # list_folders bypass (e.g. another tool reading directly) would see it.
+    # Re-issue the delete up to 3x with exponential backoff to clean up the
+    # reborn row at source. Only triggers on rows with a DIFFERENT Z_PK or
+    # ZIDENTIFIER from the one we just deleted (so this never re-deletes the
+    # row whose verify is just running slow).
+    _retry_delete_on_reappearance(
+        folder_name, parent_pk, folder_path_for_msg,
+        deleted_pk=pk, deleted_zid=folder_zid,
+    )
+
+
+def _retry_delete_on_reappearance(
+    folder_name: str,
+    parent_pk: int | None,
+    folder_path_for_msg: str,
+    *,
+    deleted_pk: int,
+    deleted_zid: str,
+    max_attempts: int = 3,
+) -> None:
+    """If a folder with the same name + parent and a DIFFERENT PK/ZID
+    reappears post-delete (CloudKit reconstitution), re-issue the delete.
+    Exponential backoff starting at 1s. Silent on success; does NOT raise
+    on final failure — the tombstone is still in effect at the cache layer
+    so user-visible behaviour is preserved."""
+    backoff_s = 1.0
+    for attempt in range(max_attempts):
+        time.sleep(backoff_s)
+        backoff_s *= 2
+        try:
+            current_rows = db.list_folders()
+        except Exception:
+            return
+        candidate = None
+        for row in current_rows:
+            row_name = row.get("name", "")
+            row_parent = row.get("parent_pk")
+            try:
+                row_pk = int(row.get("id", "f0")[1:])
+            except (ValueError, TypeError):
+                continue
+            # Skip the row we just deleted — its delete may still be
+            # propagating to SQLite. We only want a CloudKit-reborn row
+            # with a different PK.
+            if row_pk == deleted_pk:
+                continue
+            if (
+                row_name.strip().lower() == folder_name.strip().lower()
+                and row_parent == parent_pk
+            ):
+                candidate = (row_pk, row)
+                break
+        if candidate is None:
+            return  # no reborn row, nothing to retry
+        reborn_pk, _row = candidate
+        reborn_zid = db.folder_zid_by_pk(reborn_pk)
+        if reborn_zid is None or reborn_zid == deleted_zid:
+            # Either gone already or it's somehow still the same row.
+            return
+        ok, _err = _attempt_folder_delete(
+            reborn_zid, reborn_pk, folder_name, timeout_s=5.0,
+        )
+        try:
+            from . import cache as _cache
+            _cache.tombstone_folder(
+                reborn_pk, parent_pk=parent_pk, name=folder_name, zid=reborn_zid,
+            )
+        except Exception:
+            pass
+        if ok:
+            return  # cleaned up
+    # Final attempt failed; the cache-layer tombstone keeps the folder
+    # hidden for the rest of the TTL window. Not a hard failure.
 
 
 _RECURSIVE_DEPTH_CAP = 8
@@ -1942,16 +2194,24 @@ def delete_note(note_id: str, confirm_shared_delete: bool = False) -> MutationRe
     except Exception:
         pass
 
-    # Verify the move actually happened against SQLite. v12 audit found that on
-    # a corrupted bridge, AppleScript "succeeds" silently without moving the note.
-    # Without this verification we'd return {action:"deleted"} while the note is
-    # still live in its original folder. Raise instead of lying.
+    # Verify the move actually happened. v12 audit found that on a corrupted
+    # bridge, AppleScript "succeeds" silently without moving the note. v1.1
+    # added a fourth signal — an AppleScript object-graph probe — because the
+    # SQLite-only signals can lag 60s+ under load even when the move IS in
+    # flight (Notes.app's MOC commits asynchronously).
     #
-    # Three success signals (any one is enough):
+    # Four success signals (any one is enough):
     #   1. Note's row is gone from SQLite (participant-delete on shared notes)
     #   2. Note's ZFOLDER changed away from source (move to trash committed)
-    #   3. ACHANGE has a delete row for the note PK (MOC may be backed up but
-    #      the AS transaction committed — same trick we use for folders)
+    #   3. ACHANGE has a delete row for the note PK (MOC backlogged but AS
+    #      transaction committed)
+    #   4. AppleScript reports the container of the note IS the trash folder
+    #      (authoritative second source — same trick _attempt_folder_delete uses)
+    #
+    # If none of those confirm within the timeout window, we no longer raise —
+    # the move is almost certainly in flight. Return MutationResult with
+    # verified=False so the caller can retry verification rather than treat
+    # it as a hard failure.
     if note_zid and source_folder_pk is not None:
         trash_pks = db.trash_folder_pks()
 
@@ -1969,15 +2229,50 @@ def delete_note(note_id: str, confirm_shared_delete: bool = False) -> MutationRe
             return False
 
         if not _wait_for_state(_delete_commited, timeout_s=MOC_COMMIT_TIMEOUT_S, max_pings=8):
-            cur = db.note_state_by_zid(note_zid)
-            if cur is not None and cur["folder_pk"] == source_folder_pk:
-                raise ValueError(
-                    f"note {note_id!r}: AppleScript reported success but the note "
-                    f"did not move to Recently Deleted within {MOC_COMMIT_TIMEOUT_S:.0f}s. "
-                    "Notes.app's MOC may be busy with other operations; the move may "
-                    "complete shortly. If you've just done a bulk create/move, wait a "
-                    "few seconds and retry."
+            # Signal 4 — AS object-graph probe. Ask Notes.app directly:
+            # is the container of this note the trash folder, or is the note
+            # un-addressable (already deleted)? Either is a confirmed delete
+            # even when SQLite hasn't caught up yet. Read-only probe with a
+            # short timeout — no risk of corrupting the bridge.
+            as_confirmed = False
+            try:
+                probe_script = (
+                    f'tell application "Notes" to return '
+                    f'name of container of (first note whose id is {aps.quote(full_uri)})'
                 )
+                container_name = aps.run(probe_script, timeout=aps.READ_ONLY_TIMEOUT)
+                if container_name:
+                    # If Notes.app puts the note in 'Recently Deleted' (or
+                    # localized variant containing 'delet'), treat as deleted.
+                    name_lc = container_name.strip().lower()
+                    if "delet" in name_lc or "trash" in name_lc:
+                        as_confirmed = True
+            except aps.AppleScriptError as exc:
+                # Un-addressable note means AS can't find it → already deleted.
+                if "invalid index" in str(exc).lower() or "doesn't exist" in str(exc).lower():
+                    as_confirmed = True
+            except Exception:
+                pass
+
+            if not as_confirmed:
+                cur = db.note_state_by_zid(note_zid)
+                if cur is not None and cur["folder_pk"] == source_folder_pk:
+                    # Don't raise — the operation is almost certainly in
+                    # flight. Return verified=False and let the caller decide
+                    # whether to retry or accept the pending state.
+                    return MutationResult(
+                        id=db.short_id(pk),
+                        action="deleted",
+                        verified=False,
+                        warning=(
+                            f"AppleScript reported success but the move to Recently Deleted "
+                            f"could not be confirmed within {MOC_COMMIT_TIMEOUT_S:.0f}s "
+                            "(neither SQLite nor the AppleScript object graph). "
+                            "Notes.app's MOC is likely backlogged after bulk ops; "
+                            "the delete will commit shortly. Retry list_notes or "
+                            "get_note in a few seconds to confirm."
+                        ),
+                    )
 
     return MutationResult(id=db.short_id(pk), action="deleted")
 

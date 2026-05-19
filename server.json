@@ -3,6 +3,7 @@
   "name": "io.github.sweir1/apple-notes-brain",
   "title": "Apple Notes Brain",
   "description": "Apple Notes MCP server: read, write, and search Apple Notes on macOS with full Markdown round-trip. Reads via SQLite (sub-100ms, concurrent with Notes.app), writes via AppleScript (preserves iCloud sync). No plugin or fork required.",
+  "websiteUrl": "https://sweir1.github.io/apple-notes-brain/",
   "repository": {
     "url": "https://github.com/sweir1/apple-notes-brain",
     "source": "github"
@@ -86,18 +87,32 @@
         },
         {
           "name": "EMBEDDING_PROVIDER",
-          "description": "Which embedder to use. 'onnx' (default, in-process ONNX with CoreML execution provider on macOS Apple Silicon) or 'ollama' (HTTP, expects an Ollama server at OLLAMA_BASE_URL).",
+          "description": "Which embedder to use. 'onnx' (default, in-process ONNX with CoreML execution provider on macOS Apple Silicon) or 'ollama' (HTTP, expects an Ollama server at OLLAMA_BASE_URL). When paired with EMBEDDING_PRESET and the two disagree on provider, EMBEDDING_PROVIDER wins and a one-shot warning is emitted on stderr.",
           "isRequired": false,
           "format": "string",
           "default": "onnx",
           "choices": ["onnx", "ollama"]
         },
         {
-          "name": "EMBEDDING_MODEL",
-          "description": "Short-name preset (bge-small-en-v1.5 default, bge-base-en-v1.5, all-MiniLM-L6-v2) or a literal HuggingFace repo / Ollama model identifier. Switching models forces a full re-embed on next indexing pass.",
+          "name": "EMBEDDING_PRESET",
+          "description": "Named embedding preset (mirrors obsidian-brain). 'english' (default, bge-small-en-v1.5, 384d), 'english-fast' (mdbr-leaf-ir, 384d), 'english-quality' (bge-base-en-v1.5, 768d), 'multilingual' (e5-small, 384d), 'multilingual-quality' (e5-base, 768d), or 'multilingual-ollama' (qwen3-embedding:0.6b via Ollama, 1024d). Sets provider + model atomically. EMBEDDING_MODEL overrides this when both are set.",
           "isRequired": false,
           "format": "string",
-          "default": "bge-small-en-v1.5"
+          "default": "english",
+          "choices": [
+            "english",
+            "english-fast",
+            "english-quality",
+            "multilingual",
+            "multilingual-quality",
+            "multilingual-ollama"
+          ]
+        },
+        {
+          "name": "EMBEDDING_MODEL",
+          "description": "Literal HuggingFace repo (e.g. 'Xenova/bge-small-en-v1.5') or Ollama model identifier. Overrides EMBEDDING_PRESET when both are set. Switching models forces a full re-embed on next indexing pass. Legacy short-names (bge-small-en-v1.5, bge-base-en-v1.5, all-MiniLM-L6-v2) still resolve to their canonical preset with a deprecation warning.",
+          "isRequired": false,
+          "format": "string"
         },
         {
           "name": "EMBEDDING_DIM",
@@ -131,6 +146,28 @@
           "format": "string",
           "default": "1",
           "choices": ["0", "1"]
+        },
+        {
+          "name": "APPLE_NOTES_BRAIN_NO_PREWARM",
+          "description": "Set to '1' to skip the AppleScript pre-warm ping at server startup. Pre-warm normally triggers the Automation permission prompt before any user-invoked tool call and wakes Notes.app so it flushes in-memory state. Useful in headless / CI contexts where there's no user to grant the prompt.",
+          "isRequired": false,
+          "format": "string",
+          "default": "0",
+          "choices": ["0", "1"]
+        },
+        {
+          "name": "APPLE_NOTES_BRAIN_NO_CATCHUP",
+          "description": "Set to '1' to skip the catch-up semantic reindex on startup. Catch-up is normally run once on boot to bring the semantic index in sync with NoteStore.sqlite after a server restart. Has no effect without the [semantic] install extra.",
+          "isRequired": false,
+          "format": "string",
+          "default": "0",
+          "choices": ["0", "1"]
+        },
+        {
+          "name": "APPLE_NOTES_BRAIN_CONFIG_DIR",
+          "description": "Directory for user-config overrides (model-overrides.json, etc.). Defaults to $XDG_CONFIG_HOME/apple-notes-brain or ~/.config/apple-notes-brain. Read at startup to layer over bundled / fetched model metadata.",
+          "isRequired": false,
+          "format": "string"
         }
       ]
     }

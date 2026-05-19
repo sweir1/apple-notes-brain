@@ -88,7 +88,12 @@ jobs:
             exit 1
           fi
           echo "✓ server.json versions match: ${tag_version}"
-          echo "::warning title=server.json env vars::Reminder: server.json environmentVariables are NOT auto-synced. If you added new env vars in code since the last release, hand-edit server.json before tagging."
+
+      - name: env-var drift check (server.json ↔ src/)
+        # check_env_vars.py replaces the old manual reminder: any env var
+        # read in src/ but missing from server.json hard-fails here.
+        run: |
+          python3 scripts/check_env_vars.py
 
   # ----------------------------------------------------------------------
   # Job 2 — Run the unit test suite.
@@ -111,6 +116,15 @@ jobs:
       # sees this var. The macos-latest system Python is built without
       # --enable-loadable-sqlite-extensions which sqlite_vec.load() needs.
       UV_PYTHON_PREFERENCE: only-managed
+      # Pin huggingface_hub model cache to a known workspace path so the
+      # restore step below targets the same dir the prefetch step writes
+      # to and the ONNX embedder reads from. No save step in release.yml —
+      # saves live in ci.yml on main pushes only, and tag-pushed release
+      # runs read main's cache via cross-ref fallthrough (GitHub Actions
+      # caches saved on the default branch are visible to all other refs,
+      # including tags). Mirrors obsidian-brain release.yml's restore-only
+      # pattern.
+      HF_HOME: ${{ github.workspace }}/.cache/huggingface
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
 
@@ -124,9 +138,80 @@ jobs:
           python-version: "3.11"
           enable-cache: true
 
+      - name: Restore HuggingFace model cache
+        # Restore-only (no save) — saves live in ci.yml's validate job on
+        # main pushes. GitHub Actions caches are scoped per-ref: tag-pushed
+        # workflows can't share caches with each other but CAN read from
+        # the default-branch (main) scope via cross-ref fallthrough. The
+        # restore-keys ladder is intentionally redundant with ci.yml's
+        # so a release that runs before main has populated v1 still picks
+        # up an older partial-key match.
+        uses: actions/cache/restore@v5
+        continue-on-error: true
+        id: hf-cache-restore
+        with:
+          path: ${{ github.workspace }}/.cache/huggingface
+          key: hf-models-bge-small-en-v1.5-v1
+          restore-keys: |
+            hf-models-bge-small-en-v1.5-
+            hf-models-
+
+      - name: Restore MTEB venv (for seed regeneration)
+        # Restore-only — saves live in ci.yml's warm-mteb-venv job on
+        # main pushes. Same cross-ref fallthrough principle as the HF
+        # model cache above; release runs read main's cache.
+        #
+        # Patch-version pinned because torch/scipy ABI breaks on Python
+        # patch drift. No restore-keys fallback for the same reason.
+        uses: actions/cache/restore@v5
+        continue-on-error: true
+        id: mteb-venv-restore
+        with:
+          path: ~/.venv-mteb
+          key: mteb-venv-${{ runner.os }}-${{ runner.arch }}-py${{ steps.setup-python.outputs.python-version || '3.11' }}-${{ hashFiles('scripts/requirements-build-seed.txt') }}-v1
+
+      - name: Regenerate seed-models.json from MTEB (cache hit only)
+        # If the MTEB venv is warm, regenerate the bundled seed JSON so
+        # the release tarball ships the freshest model metadata that
+        # MTEB upstream knows about. Zero HF API calls — MTEB packs its
+        # own curated prompts + max_tokens for every model.
+        #
+        # `continue-on-error: true` means a failed regen (mteb upgrade
+        # broke our extractor; flake) does NOT block the release. The
+        # committed anchor at src/apple_notes_brain/data/seed-models.json
+        # still ships in the wheel.
+        if: steps.mteb-venv-restore.outputs.cache-hit == 'true'
+        run: ~/.venv-mteb/bin/python scripts/build-seed.py
+        continue-on-error: true
+
+      - name: Validate regenerated seed parses
+        if: steps.mteb-venv-restore.outputs.cache-hit == 'true'
+        run: |
+          python3 -c "import json; d = json.load(open('src/apple_notes_brain/data/seed-models.json')); assert len(d['models']) > 0, 'empty seed'; print(f'seed: {len(d[\"models\"])} models')"
+
       - name: Install dependencies
         # Both extras so the semantic test suite collects + runs.
         run: uv sync --extra dev --extra semantic
+
+      - name: Prefetch ONNX model (so the slow integration test is fast)
+        # Same model + filenames as ci.yml's prefetch. Cheap on a cache
+        # hit (huggingface_hub validates etag and reuses the local file);
+        # on a cold release runner (no cache hit at all, e.g. very first
+        # release after the cache scheme changed) this is the rate-limited
+        # download that the cache exists to amortise. continue-on-error
+        # left false: a release should fail visibly rather than ship a
+        # build whose integration test couldn't even fetch the model.
+        id: prefetch
+        run: |
+          uv run python -c "
+          from huggingface_hub import hf_hub_download
+          import os
+          cache = os.environ['HF_HOME']
+          for fname in ['onnx/model_quantized.onnx', 'tokenizer.json']:
+              hf_hub_download(repo_id='Xenova/bge-small-en-v1.5', filename=fname, cache_dir=cache)
+          print('prefetch ok')
+          "
+        continue-on-error: false
 
       - name: Run pytest
         run: uv run pytest -q
@@ -206,3 +291,46 @@ jobs:
         #   - Reading dist/*.whl + dist/*.tar.gz
         #   - Authenticating via OIDC (because id-token: write is set)
         #   - Generating PEP 740 attestations automatically
+
+  # ----------------------------------------------------------------------
+  # Job 5 — Publish server metadata to the MCP Registry.
+  # https://registry.modelcontextprotocol.io/
+  #
+  # The MCP Registry only hosts metadata, not artifacts — so PyPI must
+  # succeed first (the `needs: publish` gate).
+  #
+  # Authentication is GitHub OIDC ("github-oidc"). No secrets required —
+  # mcp-publisher exchanges the GitHub Actions OIDC token for a registry
+  # JWT scoped to the `io.github.sweir1/*` namespace.
+  #
+  # PyPI verification: the registry validates that apple-notes-brain's
+  # PyPI README contains `mcp-name: io.github.sweir1/apple-notes-brain`
+  # (HTML comment in README.md). If that line is missing, publish fails
+  # with "Registry validation failed for package".
+  # ----------------------------------------------------------------------
+  publish-mcp-registry:
+    name: Publish to MCP Registry
+    needs: publish
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write   # mandatory for github-oidc auth
+      contents: read
+    steps:
+      - name: Checkout (need server.json)
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+
+      - name: Install mcp-publisher
+        run: |
+          set -euo pipefail
+          os=$(uname -s | tr '[:upper:]' '[:lower:]')
+          arch=$(uname -m | sed 's/x86_64/amd64/;s/aarch64/arm64/')
+          curl -fsSL "https://github.com/modelcontextprotocol/registry/releases/latest/download/mcp-publisher_${os}_${arch}.tar.gz" \
+            | tar xz mcp-publisher
+          ./mcp-publisher --help >/dev/null
+          echo "✓ mcp-publisher installed"
+
+      - name: Authenticate to MCP Registry (GitHub OIDC)
+        run: ./mcp-publisher login github-oidc
+
+      - name: Publish server.json to MCP Registry
+        run: ./mcp-publisher publish

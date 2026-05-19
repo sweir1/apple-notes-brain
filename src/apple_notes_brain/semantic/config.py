@@ -34,6 +34,7 @@ ENV_DEBUG = "APPLE_NOTES_BRAIN_DEBUG"
 
 ENV_PROVIDER = "EMBEDDING_PROVIDER"
 ENV_MODEL = "EMBEDDING_MODEL"
+ENV_PRESET = "EMBEDDING_PRESET"
 ENV_DIM = "EMBEDDING_DIM"
 ENV_ONNX_PROVIDERS = "EMBEDDING_ONNX_PROVIDERS"
 
@@ -46,7 +47,10 @@ ENV_OLLAMA_AUTO_PULL = "APPLE_NOTES_BRAIN_OLLAMA_AUTO_PULL"
 # ---------------------------------------------------------------------------
 
 DEFAULT_PROVIDER: Literal["onnx", "ollama"] = "onnx"
-DEFAULT_MODEL_PRESET = "bge-small-en-v1.5"  # 384-dim, ~30MB ONNX-quantised
+# Concrete HF model id of the default preset (`english`). Resolved via
+# `resolve_preset_config()`; kept as a module constant for back-compat
+# imports (tests assert on it).
+DEFAULT_MODEL_PRESET = "Xenova/bge-small-en-v1.5"  # 384-dim, ~30MB ONNX-quantised
 DEFAULT_INDEX_INTERVAL_SECONDS = 30.0
 DEFAULT_OLLAMA_BASE_URL = "http://localhost:11434"
 DEFAULT_OLLAMA_NUM_CTX_FALLBACK = 8192
@@ -181,6 +185,12 @@ class SemanticConfig:
 
     provider: Literal["onnx", "ollama"]
     model: str
+    # Canonical short name of the preset that produced (provider, model),
+    # or None when the user set EMBEDDING_MODEL explicitly (the
+    # "power-user" path) or `EMBEDDING_PROVIDER=ollama` alone (no preset
+    # implied — falls back to DEFAULT_OLLAMA_MODEL). Resolved atomically
+    # alongside provider/model via `resolve_preset_config()`.
+    preset_short_name: str | None
     dim_override: int | None
     onnx_providers_override: tuple[str, ...] | None
 
@@ -191,14 +201,19 @@ class SemanticConfig:
 
 def load_config() -> SemanticConfig:
     """Materialise the full env-derived config. Safe to call many times;
-    each call re-reads os.environ so tests can monkeypatch between calls."""
+    each call re-reads os.environ so tests can monkeypatch between calls.
 
-    provider_raw = os.environ.get(ENV_PROVIDER, DEFAULT_PROVIDER).strip().lower()
-    if provider_raw not in {"onnx", "ollama"}:
-        raise ValueError(
-            f"{ENV_PROVIDER}={provider_raw!r} is not supported. "
-            f"Use 'onnx' (default, in-process) or 'ollama' (HTTP)."
-        )
+    Provider + model + preset_short_name are resolved atomically via
+    `resolve_preset_config()` in `embedder/presets.py` so they cannot
+    drift from each other. Calling that resolver also performs the
+    EMBEDDING_PROVIDER validity check, so we drop the separate
+    `provider_raw not in {…}` guard.
+    """
+    # Imported lazily so config.py stays import-cheap (tests that build
+    # SemanticConfig directly via the dataclass don't pay the cost).
+    from .embedder.presets import resolve_preset_config
+
+    resolved = resolve_preset_config(os.environ)
 
     ep_raw = os.environ.get(ENV_ONNX_PROVIDERS, "").strip()
     onnx_providers: tuple[str, ...] | None = None
@@ -223,8 +238,9 @@ def load_config() -> SemanticConfig:
             else None
         ),
         debug=_bool_env(ENV_DEBUG, default=False),
-        provider=provider_raw,  # type: ignore[arg-type]
-        model=os.environ.get(ENV_MODEL, DEFAULT_MODEL_PRESET).strip(),
+        provider=resolved.provider,
+        model=resolved.model,
+        preset_short_name=resolved.preset_short_name,
         dim_override=(
             _int_env(ENV_DIM, default=0, min_value=1) or None
             if os.environ.get(ENV_DIM)

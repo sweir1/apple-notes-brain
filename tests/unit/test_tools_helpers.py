@@ -615,6 +615,13 @@ def test_bug_locked_field_missing_now_raises(mocker):
     mocker.patch("apple_notes_brain.sqlite_reader.note_meta", return_value=meta)
     mocker.patch("apple_notes_brain.sqlite_reader.trash_folder_pks", return_value=set())
     mocker.patch("apple_notes_brain.sqlite_reader.attachment_count", return_value=0)
+    mocker.patch(
+        "apple_notes_brain.sqlite_reader.attachment_breakdown",
+        return_value={
+            b: {"count": 0, "destructive": b != "table", "utis": [], "filenames": []}
+            for b in ("image", "sketch", "scan", "audio", "file", "table")
+        },
+    )
     mocker.patch("apple_notes_brain.sqlite_reader.short_id", return_value="p100")
 
     with pytest.raises(ValueError, match="cannot determine lock state"):

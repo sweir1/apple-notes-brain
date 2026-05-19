@@ -22,6 +22,7 @@ import time
 from collections.abc import Callable
 from typing import Any
 
+from ._logging import debug_log
 from .source import NotesSource
 
 _log = logging.getLogger("apple-notes-brain")
@@ -126,13 +127,21 @@ class SemanticWatcher:
                     exc,
                 )
                 continue
+            debug_log(
+                f"watcher: tick #{self._tick_count} "
+                f"data_version={current_dv} last={self._last_seen_dv}"
+            )
             if self._last_seen_dv is not None and current_dv == self._last_seen_dv:
                 # Nothing changed since the last tick — cheap path.
                 continue
             self._last_seen_dv = current_dv
+            debug_log("watcher: data_version changed, triggering reindex")
             try:
                 self._indexer.index_all(self._source)
                 self._reindex_count += 1
+                _log.info(
+                    "watcher: reindex pass %d complete", self._reindex_count
+                )
             except Exception as exc:
                 self._error_count += 1
                 _log.warning(

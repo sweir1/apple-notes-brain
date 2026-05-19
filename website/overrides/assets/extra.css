@@ -1,0 +1,17 @@
+/*
+ * Hide the mkdocs-material repo facts in the chrome:
+ *   - md-source__fact--version: shows the latest published GitHub Release tag.
+ *   - md-source__fact--stars / --forks: GitHub stars + fork count.
+ *
+ * Why hide:
+ *   The version fact is fetched from GitHub's API at site build time and
+ *   reflects the latest *published* GitHub Release, not the in-repo version.
+ *   It goes stale between releases. The stars/forks counts are noise on a
+ *   docs page. Hiding them is the lowest-risk fix; the docs site itself
+ *   surfaces the current version via the macros plugin where it matters.
+ */
+.md-source__fact--version,
+.md-source__fact--stars,
+.md-source__fact--forks {
+  display: none;
+}
