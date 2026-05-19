@@ -23,7 +23,10 @@ from apple_notes_brain.tools import _sanitize_html_input
 # Per-payload wall-clock cap. Set well above the typical (<5ms) runtime;
 # a value this large still catches the catastrophic-backtracking failure
 # mode (those go to seconds-minutes), while not flaking under GHA noise.
-SANITISE_BUDGET_S = 0.100
+# Bumped from 0.1s → 1.0s after macos-latest hit ~250ms on a cold bleach
+# parser init (lxml backend cold cache); 1.0s is still 3+ orders of
+# magnitude below catastrophic backtracking.
+SANITISE_BUDGET_S = 1.0
 
 
 # ---------------------------------------------------------------------------
