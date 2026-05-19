@@ -26,8 +26,8 @@ The table below is generated from the tool registrations in [`src/apple_notes_br
 
 | Tool | Kind | What it does |
 |---|---|---|
-| `semantic_search(query, limit?, unique?, include_trash?)` | read | Embedding-based semantic search over chunked note bodies. |
-| `hybrid_search(query, limit?, unique?, include_trash?)` | read | Reciprocal-rank-fused semantic + lexical search. Higher recall than either alone for most queries. |
+| `semantic_search(query, limit?, unique?)` | read | Embedding-based semantic search over chunked note bodies. |
+| `hybrid_search(query, limit?, unique?)` | read | Reciprocal-rank-fused semantic + lexical search. Higher recall than either alone for most queries. |
 | `reindex_semantic(force?)` | write | Trigger a full pass of the semantic indexer. |
 | `semantic_index_status()` | read | Snapshot of the semantic index + embedder configuration. |
 <!-- /GENERATED:tools -->
