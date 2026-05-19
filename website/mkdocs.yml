@@ -1,0 +1,164 @@
+site_name: apple-notes-brain
+site_url: https://sweir1.github.io/apple-notes-brain/
+site_description: >-
+  A local MCP server that gives Claude and other MCP clients full read/write
+  access to Apple Notes on macOS — Markdown round-trip, semantic + hybrid
+  search, no cloud, notes never leave your machine.
+site_author: sweir1
+
+# Markdown source lives at repo-root ../docs/ so existing cross-links (README,
+# in-code references) keep working. This config file + overrides/ are the only
+# docs-tooling files we need to keep near them.
+docs_dir: ../docs
+
+repo_name: sweir1/apple-notes-brain
+repo_url: https://github.com/sweir1/apple-notes-brain
+edit_uri: edit/main/docs/
+
+copyright: >-
+  Built by <a href="https://github.com/sweir1">sweir1</a> · Apache 2.0 licensed.
+
+# Promote MkDocs' quiet INFO-level link warnings to WARN so `mkdocs build
+# --strict` actually fails on broken anchors and missing targets. Without
+# this the default INFO level slips past --strict and broken links
+# accumulate silently across releases.
+validation:
+  nav:
+    omitted_files: warn
+    not_found: warn
+    absolute_links: warn
+  links:
+    not_found: warn
+    absolute_links: warn
+    unrecognized_links: warn
+    anchors: warn
+
+theme:
+  name: material
+  custom_dir: overrides
+  logo: assets/logo.svg
+  favicon: assets/logo.svg
+  icon:
+    repo: fontawesome/brands/github
+    edit: material/pencil-outline
+  palette:
+    - media: "(prefers-color-scheme: light)"
+      scheme: default
+      primary: amber
+      accent: amber
+      toggle:
+        icon: material/weather-sunny
+        name: Switch to dark mode
+    - media: "(prefers-color-scheme: dark)"
+      scheme: slate
+      primary: amber
+      accent: amber
+      toggle:
+        icon: material/weather-night
+        name: Switch to light mode
+  features:
+    - navigation.instant
+    - navigation.instant.progress
+    - navigation.tracking
+    - navigation.tabs
+    - navigation.tabs.sticky
+    - navigation.sections
+    - navigation.top
+    - navigation.footer
+    - toc.follow
+    - search.suggest
+    - search.highlight
+    - search.share
+    - content.code.copy
+    - content.code.annotate
+    - content.tabs.link
+    - content.action.edit
+
+plugins:
+  - search
+  - git-revision-date-localized:
+      type: date
+      enable_creation_date: false
+      fallback_to_build_date: true
+  - macros
+
+markdown_extensions:
+  - abbr
+  - admonition
+  - attr_list
+  - def_list
+  - footnotes
+  - md_in_html
+  - tables
+  - toc:
+      permalink: "¶"
+      permalink_title: Anchor
+  - pymdownx.betterem
+  - pymdownx.caret
+  - pymdownx.details
+  - pymdownx.emoji:
+      emoji_index: !!python/name:material.extensions.emoji.twemoji
+      emoji_generator: !!python/name:material.extensions.emoji.to_svg
+  - pymdownx.highlight:
+      anchor_linenums: true
+      line_spans: __span
+      pygments_lang_class: true
+  - pymdownx.inlinehilite
+  - pymdownx.keys
+  - pymdownx.mark
+  - pymdownx.smartsymbols
+  - pymdownx.snippets
+  - pymdownx.superfences:
+      custom_fences:
+        - name: mermaid
+          class: mermaid
+          format: !!python/name:pymdownx.superfences.fence_code_format
+  - pymdownx.tabbed:
+      alternate_style: true
+  - pymdownx.tasklist:
+      custom_checkbox: true
+  - pymdownx.tilde
+
+extra_css:
+  - assets/extra.css
+
+extra:
+  generator: false
+  social:
+    - icon: fontawesome/brands/github
+      link: https://github.com/sweir1/apple-notes-brain
+      name: apple-notes-brain on GitHub
+    - icon: fontawesome/brands/python
+      link: https://pypi.org/project/apple-notes-brain/
+      name: apple-notes-brain on PyPI
+
+nav:
+  - Home: index.md
+
+  - Get started:
+      - Quick start: getting-started.md
+      - macOS walkthrough (non-technical): install-mac-nontechnical.md
+      - Install in your MCP client: install-clients.md
+      - Configuration: configuration.md
+
+  - Tools: tools.md
+
+  - How it works:
+      - Architecture: architecture.md
+      - How embeddings work: embeddings.md
+      - Models: models.md
+
+  - Help:
+      - Troubleshooting: troubleshooting.md
+
+  - Project:
+      - Changelog: CHANGELOG.md
+      - Roadmap: roadmap.md
+      - Build from source: development.md
+
+# Internal reference docs — kept in the repo for developers but intentionally
+# off the public nav. Listed here so `mkdocs build --strict` doesn't warn
+# about them being unreferenced.
+not_in_nav: |
+  /apple-notes-features.md
+  /cache-sync-research.md

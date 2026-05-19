@@ -1,0 +1,109 @@
+name: Bug report
+description: Something's broken, wrong, or misbehaving.
+title: "[bug] "
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for taking the time to report a bug. The fields below cover the most common root causes — filling them in up front usually cuts triage back-and-forth in half.
+
+        Before opening: please check [Troubleshooting](https://sweir1.github.io/apple-notes-brain/troubleshooting/) for known issues (Full Disk Access, Automation permission, attachment-destructive writes, cache staleness).
+
+  - type: input
+    id: version
+    attributes:
+      label: apple-notes-brain version
+      description: What version is actually starting? Check the MCP log, or run `pip show apple-notes-brain`. If your client config uses `uvx apple-notes-brain`, look at `~/.cache/uv/` to see what resolved.
+      placeholder: "e.g. 1.1.0"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: client
+    attributes:
+      label: MCP client
+      options:
+        - Claude Desktop
+        - Claude Code
+        - Cursor
+        - Continue
+        - Cline
+        - Zed
+        - VS Code
+        - LM Studio
+        - Other (please say which in "What happened")
+    validations:
+      required: true
+
+  - type: input
+    id: os
+    attributes:
+      label: macOS version
+      placeholder: "e.g. macOS 14.5 (Apple Silicon)"
+    validations:
+      required: true
+
+  - type: input
+    id: python-version
+    attributes:
+      label: Python version
+      description: Run `python3 --version`. If your client uses `uvx`, also run `uvx --python` to see which Python uv is managing.
+      placeholder: "e.g. 3.11.10 (shell) / 3.11.10 (uv-managed)"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: install-method
+    attributes:
+      label: How was apple-notes-brain installed?
+      options:
+        - one-line install.sh
+        - uvx (ephemeral)
+        - uv tool install
+        - pip
+        - from source
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: What you expected
+    validations:
+      required: true
+
+  - type: textarea
+    id: actual
+    attributes:
+      label: What happened
+      description: Include any error message verbatim.
+    validations:
+      required: true
+
+  - type: textarea
+    id: log
+    attributes:
+      label: Last ~20 lines of the client's MCP log
+      description: |
+        - **Claude Desktop (macOS)**: `~/Library/Logs/Claude/mcp-server-apple-notes-brain.log`
+        - **Cursor**: Command Palette → "Cursor: Show Logs" → look for the MCP server entry
+        - Most clients: look in Settings → Logs, or the app's log directory
+      render: shell
+
+  - type: textarea
+    id: config
+    attributes:
+      label: Your client config for this server
+      description: The JSON block wiring apple-notes-brain into your client.
+      render: json
+
+  - type: checkboxes
+    id: sanity-checks
+    attributes:
+      label: Sanity checks
+      description: These catch ~80% of reported issues. Please confirm each before submitting.
+      options:
+        - label: Full Disk Access is granted to BOTH the MCP client app AND `/usr/local/bin/uvx` (System Settings → Privacy & Security → Full Disk Access)
+        - label: Automation permission is granted for the MCP client to control Notes (System Settings → Privacy & Security → Automation → expand the client → Notes toggled on)
+        - label: I've restarted the MCP client since changing those permissions

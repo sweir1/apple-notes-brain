@@ -95,13 +95,22 @@ semantic = [
     "httpx>=0.27",
     "numpy>=1.24",
 ]
+# Documentation site (MkDocs Material). Only needed to build/serve the docs
+# locally and in CI — not required to run apple-notes-brain. Install with:
+#   uv sync --extra docs
+# Kept minimal on purpose: the docs venv in CI restores in <1s on cache hit.
+docs = [
+    "mkdocs-material~=9.7",
+    "mkdocs-git-revision-date-localized-plugin~=1.5",
+    "mkdocs-macros-plugin~=1.5",
+]
 
 [project.urls]
-Homepage = "https://github.com/sweir1/apple-notes-brain"
+Homepage = "https://sweir1.github.io/apple-notes-brain/"
 Repository = "https://github.com/sweir1/apple-notes-brain"
 Issues = "https://github.com/sweir1/apple-notes-brain/issues"
-Changelog = "https://github.com/sweir1/apple-notes-brain/releases"
-Documentation = "https://github.com/sweir1/apple-notes-brain#readme"
+Changelog = "https://sweir1.github.io/apple-notes-brain/CHANGELOG/"
+Documentation = "https://sweir1.github.io/apple-notes-brain/"
 "Source Code" = "https://github.com/sweir1/apple-notes-brain"
 
 [project.scripts]
