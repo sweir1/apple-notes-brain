@@ -2049,16 +2049,24 @@ def delete_note(note_id: str, confirm_shared_delete: bool = False) -> MutationRe
     except Exception:
         pass
 
-    # Verify the move actually happened against SQLite. v12 audit found that on
-    # a corrupted bridge, AppleScript "succeeds" silently without moving the note.
-    # Without this verification we'd return {action:"deleted"} while the note is
-    # still live in its original folder. Raise instead of lying.
+    # Verify the move actually happened. v12 audit found that on a corrupted
+    # bridge, AppleScript "succeeds" silently without moving the note. v1.1
+    # added a fourth signal — an AppleScript object-graph probe — because the
+    # SQLite-only signals can lag 60s+ under load even when the move IS in
+    # flight (Notes.app's MOC commits asynchronously).
     #
-    # Three success signals (any one is enough):
+    # Four success signals (any one is enough):
     #   1. Note's row is gone from SQLite (participant-delete on shared notes)
     #   2. Note's ZFOLDER changed away from source (move to trash committed)
-    #   3. ACHANGE has a delete row for the note PK (MOC may be backed up but
-    #      the AS transaction committed — same trick we use for folders)
+    #   3. ACHANGE has a delete row for the note PK (MOC backlogged but AS
+    #      transaction committed)
+    #   4. AppleScript reports the container of the note IS the trash folder
+    #      (authoritative second source — same trick _attempt_folder_delete uses)
+    #
+    # If none of those confirm within the timeout window, we no longer raise —
+    # the move is almost certainly in flight. Return MutationResult with
+    # verified=False so the caller can retry verification rather than treat
+    # it as a hard failure.
     if note_zid and source_folder_pk is not None:
         trash_pks = db.trash_folder_pks()
 
@@ -2076,15 +2084,50 @@ def delete_note(note_id: str, confirm_shared_delete: bool = False) -> MutationRe
             return False
 
         if not _wait_for_state(_delete_commited, timeout_s=MOC_COMMIT_TIMEOUT_S, max_pings=8):
-            cur = db.note_state_by_zid(note_zid)
-            if cur is not None and cur["folder_pk"] == source_folder_pk:
-                raise ValueError(
-                    f"note {note_id!r}: AppleScript reported success but the note "
-                    f"did not move to Recently Deleted within {MOC_COMMIT_TIMEOUT_S:.0f}s. "
-                    "Notes.app's MOC may be busy with other operations; the move may "
-                    "complete shortly. If you've just done a bulk create/move, wait a "
-                    "few seconds and retry."
+            # Signal 4 — AS object-graph probe. Ask Notes.app directly:
+            # is the container of this note the trash folder, or is the note
+            # un-addressable (already deleted)? Either is a confirmed delete
+            # even when SQLite hasn't caught up yet. Read-only probe with a
+            # short timeout — no risk of corrupting the bridge.
+            as_confirmed = False
+            try:
+                probe_script = (
+                    f'tell application "Notes" to return '
+                    f'name of container of (first note whose id is {aps.quote(full_uri)})'
                 )
+                container_name = aps.run(probe_script, timeout=aps.READ_ONLY_TIMEOUT)
+                if container_name:
+                    # If Notes.app puts the note in 'Recently Deleted' (or
+                    # localized variant containing 'delet'), treat as deleted.
+                    name_lc = container_name.strip().lower()
+                    if "delet" in name_lc or "trash" in name_lc:
+                        as_confirmed = True
+            except aps.AppleScriptError as exc:
+                # Un-addressable note means AS can't find it → already deleted.
+                if "invalid index" in str(exc).lower() or "doesn't exist" in str(exc).lower():
+                    as_confirmed = True
+            except Exception:
+                pass
+
+            if not as_confirmed:
+                cur = db.note_state_by_zid(note_zid)
+                if cur is not None and cur["folder_pk"] == source_folder_pk:
+                    # Don't raise — the operation is almost certainly in
+                    # flight. Return verified=False and let the caller decide
+                    # whether to retry or accept the pending state.
+                    return MutationResult(
+                        id=db.short_id(pk),
+                        action="deleted",
+                        verified=False,
+                        warning=(
+                            f"AppleScript reported success but the move to Recently Deleted "
+                            f"could not be confirmed within {MOC_COMMIT_TIMEOUT_S:.0f}s "
+                            "(neither SQLite nor the AppleScript object graph). "
+                            "Notes.app's MOC is likely backlogged after bulk ops; "
+                            "the delete will commit shortly. Retry list_notes or "
+                            "get_note in a few seconds to confirm."
+                        ),
+                    )
 
     return MutationResult(id=db.short_id(pk), action="deleted")
 

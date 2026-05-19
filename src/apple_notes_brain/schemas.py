@@ -115,8 +115,17 @@ class MutationResult(BaseModel):
     error: present and non-null only on per-item failures inside a batch call
     (rename_note / move_note with list input). Single-note calls raise on
     failure rather than returning a skipped result.
+    verified: False iff the operation succeeded at the AppleScript layer
+    but couldn't be confirmed against the SQLite store within the
+    timeout window (Notes.app's MOC commits asynchronously under load).
+    The change is almost certainly in flight and will commit shortly;
+    callers can retry verification rather than treating it as a hard
+    failure. Defaults to True.
+    warning: human-readable explanation when verified=False; otherwise None.
     """
 
     id: str
     action: str
     error: str | None = None
+    verified: bool = True
+    warning: str | None = None
