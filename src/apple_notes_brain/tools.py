@@ -288,7 +288,8 @@ def _wait_until_as_addressable(uri: str, kind: str, max_wait_s: float = MOC_COMM
     sleep_s = 0.05
     while time.monotonic() < deadline:
         try:
-            aps.run(probe)
+            # Read-only probe — no excuse to hang for the default 30s budget.
+            aps.run(probe, timeout=aps.READ_ONLY_TIMEOUT)
             return True  # AS can now address the new object
         except aps.AppleScriptError as exc:
             if "invalid index" not in str(exc).lower():
@@ -428,14 +429,120 @@ def _folder_name_map(folders: list[dict]) -> dict[int, str]:
     return out
 
 
+_BLEACH_ALLOWED_TAGS = frozenset({
+    "p", "br", "b", "i", "u", "strong", "em", "span", "div",
+    "ul", "ol", "li",
+    "h1", "h2", "h3", "h4", "h5", "h6",
+    "blockquote", "code", "pre", "a", "img",
+    "table", "thead", "tbody", "tr", "th", "td",
+})
+_BLEACH_ALLOWED_ATTRS = {
+    "a": ["href"],
+    "img": ["src", "alt"],
+    "span": ["style"],
+    "div": ["style"],
+}
+# Hard upper bound on HTML input size. AppleScript's `set body of note` has
+# its own (poorly-documented) cap around 1MB; html5lib's parser is linear
+# but the constant is large enough that a 1MB blob takes seconds. Truncating
+# before sanitise prevents the wedge regardless of payload shape — and notes
+# longer than this aren't reasonable anyway.
+_MAX_HTML_INPUT_BYTES = 256_000
+# Tags whose entire content (not just the tag itself) must be discarded.
+# bleach's `strip=True` removes the tag wrapper but keeps text content, so
+# `<script>alert(1)</script>` would leak `alert(1)` as plain text. We
+# pre-decompose these via bs4 before invoking bleach.
+_NUKE_CONTENT_TAGS = ("script", "style", "iframe", "noscript", "object",
+                      "embed", "form", "svg", "math")
+
+
+def _sanitize_html_input(html: str) -> str:
+    """Sanitise user-supplied HTML BEFORE handing it to AppleScript.
+
+    Defence against:
+      - <script>, <iframe>, <style> with on* handlers, javascript: URIs,
+        SVG event triggers — would either execute in the Notes WebView or
+        wedge AppleScript's HTML parser on adversarial input.
+      - Catastrophic backtracking in our own regex-based normaliser. bleach
+        uses html5lib (a real tokeniser, no regex backtracking) so deeply
+        nested unclosed tags resolve in linear time.
+      - Multi-MB pathological inputs — html5lib is linear but the constant
+        is large, so we cap input size up front.
+
+    Empty result raises ValueError so we don't silently write an empty body
+    (the model's prompt asked us to put something there; signalling failure
+    is better than producing a blank note).
+    """
+    if not html or not html.strip():
+        raise ValueError(
+            "HTML body is empty after stripping whitespace — pass a non-empty body, "
+            "or use format='text' / format='markdown' for plain content."
+        )
+    if len(html) > _MAX_HTML_INPUT_BYTES:
+        raise ValueError(
+            f"HTML body is {len(html)} bytes — exceeds the {_MAX_HTML_INPUT_BYTES}-byte "
+            "limit. Apple Notes itself caps note size; split the content into "
+            "multiple notes or trim before submitting."
+        )
+
+    # Pre-pass: decompose tags whose CONTENTS must also be removed.
+    # bleach.clean(strip=True) drops tag wrappers but keeps text inside, which
+    # would let <script>alert(1)</script> leak `alert(1)` as plain text.
+    try:
+        from bs4 import BeautifulSoup
+        soup = BeautifulSoup(html, "lxml")
+        for tag_name in _NUKE_CONTENT_TAGS:
+            for el in soup.find_all(tag_name):
+                el.decompose()
+        # Also drop HTML comments outright — they can hide script tags from
+        # naive parsers.
+        from bs4 import Comment
+        for c in soup.find_all(string=lambda t: isinstance(t, Comment)):
+            c.extract()
+        pre_cleaned = str(soup)
+    except Exception:
+        # bs4 unavailable or parse failure — proceed with raw input; bleach
+        # still gives us the tag-level safety net.
+        pre_cleaned = html
+
+    try:
+        import bleach
+    except ImportError:  # pragma: no cover — bleach is in core deps
+        # Bleach unavailable — fall back to the legacy bs4-based normaliser
+        # (still safer than passing raw HTML through).
+        from .html_validate import normalize_html
+        return normalize_html(pre_cleaned)
+
+    cleaned = bleach.clean(
+        pre_cleaned,
+        tags=_BLEACH_ALLOWED_TAGS,
+        attributes=_BLEACH_ALLOWED_ATTRS,
+        protocols=["http", "https", "mailto"],  # no javascript:, data:, file:
+        strip=True,
+        strip_comments=True,
+    )
+    if not cleaned or not cleaned.strip():
+        raise ValueError(
+            "HTML body became empty after sanitisation (likely all-disallowed "
+            "tags such as <script>, <iframe>, or empty wrappers). Pass HTML "
+            "containing at least one of: p, div, br, b, i, u, span, ul/ol/li, "
+            "h1-h6, blockquote, code, pre, a, img, table."
+        )
+    return cleaned
+
+
 def _body_to_html(body: str, format: BodyFormat) -> str:
     if not body:
         return ""
     if format == "markdown":
         return markdown_to_html(body)
     if format == "html":
+        # First sanitise (linear-time tokeniser, drops script/event-handlers),
+        # then run through the Apple-Notes-preferred normaliser (tag rewrites
+        # like strong→b, h4→div) so we keep both safety AND fidelity.
+        sanitised = _sanitize_html_input(body)
         from .html_validate import normalize_html
-        return normalize_html(body)
+        return normalize_html(sanitised)
     if format == "text":
         escaped = _htmlmod.escape(body).replace("\n", "<br>")
         return f"<div>{escaped}</div>"

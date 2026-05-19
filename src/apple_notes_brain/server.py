@@ -9,9 +9,11 @@ locked notes, pagination flow).
 """
 from __future__ import annotations
 
+import functools
 import logging
-from typing import Literal
+from typing import Any, Callable, Literal
 
+import anyio
 from mcp.server.fastmcp import FastMCP
 from mcp.server.fastmcp.resources import FunctionResource
 from mcp.types import ToolAnnotations
@@ -28,6 +30,44 @@ log = logging.getLogger("apple-notes-brain")
 mcp = FastMCP("apple-notes-brain")
 
 
+def _to_thread(fn: Callable[..., Any]) -> Callable[..., Any]:
+    """Wrap a synchronous tool function so MCP runs it in a thread.
+
+    FastMCP's default scheduler calls sync tools INLINE on the asyncio event
+    loop — any subprocess.run / sqlite blocking call wedges every other tool
+    while it runs. Returning an async function that delegates to
+    `anyio.to_thread.run_sync` lets the event loop keep handling other
+    requests while AppleScript / SQLite block in a worker thread.
+
+    Critical reproducer for why this matters: a single bad
+    `create_note(format='html', body='<adversarial>')` could block osascript,
+    and with the inline scheduler EVERY subsequent tool call — even
+    pure-Python ones like `list_folders` — would hang behind it.
+
+    We keep the wrapped function's signature/annotations intact so FastMCP's
+    pydantic argument validation still picks up the schema correctly.
+    """
+    @functools.wraps(fn)
+    async def wrapper(*args: Any, **kwargs: Any) -> Any:
+        return await anyio.to_thread.run_sync(
+            functools.partial(fn, *args, **kwargs)
+        )
+    return wrapper
+
+
+def _mcp_tool(*, annotations: ToolAnnotations) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
+    """Drop-in replacement for `@mcp.tool` that thread-offloads the handler.
+
+    Use everywhere we'd otherwise write `@_mcp_tool(annotations=...)`. Keeps
+    the asyncio loop free for concurrent requests even when a handler hangs
+    in AppleScript / sqlite.
+    """
+    def decorate(fn: Callable[..., Any]) -> Callable[..., Any]:
+        wrapped = _to_thread(fn)
+        return mcp.tool(annotations=annotations)(wrapped)
+    return decorate
+
+
 READ_ONLY = ToolAnnotations(readOnlyHint=True, idempotentHint=True, openWorldHint=False)
 WRITE = ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=False, openWorldHint=False)
 DESTRUCTIVE = ToolAnnotations(readOnlyHint=False, destructiveHint=True, idempotentHint=False, openWorldHint=False)
@@ -37,7 +77,7 @@ DESTRUCTIVE = ToolAnnotations(readOnlyHint=False, destructiveHint=True, idempote
 # Read tools
 # ---------------------------------------------------------------------------
 
-@mcp.tool(annotations=READ_ONLY)
+@_mcp_tool(annotations=READ_ONLY)
 def list_folders(include_counts: bool = False, include_trash: bool = False) -> list[Folder]:
     """List Notes folders. Returns: id, path (slash-joined for nested), is_trash, account, shared.
 
@@ -51,7 +91,7 @@ def list_folders(include_counts: bool = False, include_trash: bool = False) -> l
     return tools.list_folders(include_counts=include_counts, include_trash=include_trash)
 
 
-@mcp.tool(annotations=READ_ONLY)
+@_mcp_tool(annotations=READ_ONLY)
 def list_notes(
     folder_path: str | None = None,
     limit: int = tools.DEFAULT_LIST_LIMIT,
@@ -78,7 +118,7 @@ def list_notes(
     )
 
 
-@mcp.tool(annotations=READ_ONLY)
+@_mcp_tool(annotations=READ_ONLY)
 def search_notes(
     query: str,
     folder_path: str | None = None,
@@ -135,7 +175,7 @@ def search_notes(
 # rather than crashing the server — `search_notes` above keeps working.
 # ---------------------------------------------------------------------------
 
-@mcp.tool(annotations=READ_ONLY)
+@_mcp_tool(annotations=READ_ONLY)
 def semantic_search(
     query: str,
     limit: int = 20,
@@ -159,7 +199,7 @@ def semantic_search(
     return tools_semantic.semantic_search(query, limit=limit, unique=unique)  # type: ignore[arg-type]
 
 
-@mcp.tool(annotations=READ_ONLY)
+@_mcp_tool(annotations=READ_ONLY)
 def hybrid_search(
     query: str,
     limit: int = 20,
@@ -175,7 +215,7 @@ def hybrid_search(
     return tools_semantic.hybrid_search(query, limit=limit, unique=unique)  # type: ignore[arg-type]
 
 
-@mcp.tool(annotations=WRITE)
+@_mcp_tool(annotations=WRITE)
 def reindex_semantic(force: bool = False) -> dict:
     """Trigger a full pass of the semantic indexer.
 
@@ -192,7 +232,7 @@ def reindex_semantic(force: bool = False) -> dict:
     return tools_semantic.reindex_semantic(force=force)
 
 
-@mcp.tool(annotations=READ_ONLY)
+@_mcp_tool(annotations=READ_ONLY)
 def semantic_index_status() -> dict:
     """Snapshot of the semantic index + embedder configuration.
 
@@ -204,7 +244,7 @@ def semantic_index_status() -> dict:
     return tools_semantic.semantic_index_status()
 
 
-@mcp.tool(annotations=READ_ONLY)
+@_mcp_tool(annotations=READ_ONLY)
 def get_note(
     note_id: str | list[str],
     format: str = "markdown",
@@ -241,7 +281,7 @@ def get_note(
 # Write tools
 # ---------------------------------------------------------------------------
 
-@mcp.tool(annotations=WRITE)
+@_mcp_tool(annotations=WRITE)
 def create_note(
     title: str | None = None,
     body: str | None = None,
@@ -283,7 +323,7 @@ def create_note(
     )
 
 
-@mcp.tool(annotations=WRITE)
+@_mcp_tool(annotations=WRITE)
 def update_note(
     note_id: str,
     body: str,
@@ -313,7 +353,7 @@ def update_note(
     )
 
 
-@mcp.tool(annotations=WRITE)
+@_mcp_tool(annotations=WRITE)
 def rename_note(
     note_id: str | list[str],
     new_title: str | list[str],
@@ -333,7 +373,7 @@ def rename_note(
     return tools.rename_note(note_id, new_title)
 
 
-@mcp.tool(annotations=WRITE)
+@_mcp_tool(annotations=WRITE)
 def move_note(
     note_id: str | list[str],
     folder_path: str,
@@ -350,7 +390,7 @@ def move_note(
     return tools.move_note(note_id, folder_path)
 
 
-@mcp.tool(annotations=WRITE)
+@_mcp_tool(annotations=WRITE)
 def create_folder(name: str, parent_folder_path: str | None = None) -> MutationResult:
     """Create a folder. Returns {id, action: 'created'}.
 
@@ -361,7 +401,7 @@ def create_folder(name: str, parent_folder_path: str | None = None) -> MutationR
     return tools.create_folder(name, parent_folder_path)
 
 
-@mcp.tool(annotations=WRITE)
+@_mcp_tool(annotations=WRITE)
 def rename_folder(folder_id: str, new_name: str) -> MutationResult:
     """Rename a folder. Returns {id, action: 'renamed'}.
 
@@ -371,7 +411,7 @@ def rename_folder(folder_id: str, new_name: str) -> MutationResult:
     return tools.rename_folder(folder_id, new_name)
 
 
-@mcp.tool(annotations=DESTRUCTIVE)
+@_mcp_tool(annotations=DESTRUCTIVE)
 def delete_folder(
     folder_id: str,
     allow_non_empty: bool = False,
@@ -414,7 +454,7 @@ def delete_folder(
     )
 
 
-@mcp.tool(annotations=DESTRUCTIVE)
+@_mcp_tool(annotations=DESTRUCTIVE)
 def delete_note(note_id: str, confirm_shared_delete: bool = False) -> MutationResult:
     """Move a note to Recently Deleted. Returns {id, action: 'deleted'}.
 
