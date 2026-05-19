@@ -94,6 +94,11 @@ class SemanticState:
         self.search = search
         self.source = source
         self.config = config_snapshot
+        # v1.1 Phase ζ — boot lifecycle tracking. Either string phase
+        # (pending → embedder-init → bootstrap → indexing → ready) or
+        # 'failed' with init_error populated.
+        self.boot_phase: str = "ready"  # default for synchronous get_state()
+        self.init_error: BaseException | None = None
 
     def dispose(self) -> None:
         try:

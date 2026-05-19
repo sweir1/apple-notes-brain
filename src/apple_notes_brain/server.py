@@ -626,4 +626,39 @@ def _startup_log() -> None:
         log.warning("apple-notes-brain startup probe failed: %s", exc)
 
 
+def _startup_semantic() -> None:
+    """v1.1 Phase ζ — fire-and-forget background semantic-subsystem boot.
+
+    Decouples the slow path (model download + first-time index) from
+    the MCP handshake so `tools/list` returns instantly. Tools that
+    need the embedder either wait on the cached state or return the
+    empty-index hint until the boot block reaches phase='ready'.
+
+    Gated on `APPLE_NOTES_BRAIN_NO_BOOT` so the test suite (which
+    imports server.py many times across parametrized cases) doesn't
+    trigger real HF model downloads. The MCP launcher leaves the env
+    var unset; pytest's conftest sets it to '1'.
+
+    Wrapped in try/except so a missing-extras / import failure can
+    never wedge the rest of the server.
+    """
+    import os as _os
+
+    if _os.environ.get("APPLE_NOTES_BRAIN_NO_BOOT", "").strip() == "1":
+        log.info("apple-notes-brain semantic subsystem: NO_BOOT=1, skipping")
+        return
+    try:
+        from .semantic.boot import start_semantic_subsystem_background
+
+        start_semantic_subsystem_background()
+        log.info("apple-notes-brain semantic subsystem: boot scheduled")
+    except ImportError:
+        # [semantic] extras not installed — the four semantic tools
+        # will return missing-extras envelopes on first call; no harm.
+        log.info("apple-notes-brain semantic subsystem: extras not installed, skipping")
+    except Exception as exc:  # noqa: BLE001
+        log.warning("apple-notes-brain semantic boot failed to schedule: %s", exc)
+
+
 _startup_log()
+_startup_semantic()

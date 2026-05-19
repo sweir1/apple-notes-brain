@@ -28,6 +28,17 @@ from apple_notes_brain import cache, schemas
 # pytest-randomly will surface flakes.
 # ---------------------------------------------------------------------------
 
+@pytest.fixture(scope="session", autouse=True)
+def _disable_semantic_autoboot() -> Iterator[None]:
+    """Prevent the v1.1 Phase ζ background-boot block from firing during
+    the test suite. Without this gate, any test that imports
+    apple_notes_brain.server would kick off a real HF model download
+    + first-time index against the user's NoteStore."""
+    import os
+    os.environ["APPLE_NOTES_BRAIN_NO_BOOT"] = "1"
+    yield
+
+
 @pytest.fixture(autouse=True)
 def _reset_cache_state() -> Iterator[None]:
     """Reset cache module-level overlays before each test."""
