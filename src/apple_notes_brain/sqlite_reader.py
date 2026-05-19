@@ -1038,9 +1038,13 @@ def recent_notes(limit: int = 200) -> list[dict]:
 
 
 def attachment_count(note_pk: int) -> int:
-    """Number of ICAttachment rows owned by a note. Used to guard destructive writes —
-    Apple's `set body of note` AppleScript silently removes every attachment, so we
-    must warn / refuse before invoking it on a note with attachments.
+    """Total Z_ENT=5 (ICAttachment) rows for a note.
+
+    This counts EVERYTHING Apple Notes treats as an attachment,
+    including reconstructable widgets like tables. Prefer
+    `destructive_attachment_count` for the update_note guard — tables
+    are rebuilt from the new body, so refusing to overwrite a
+    table-only note is a false positive.
     """
     with _open() as conn:
         row = conn.execute(
@@ -1048,6 +1052,119 @@ def attachment_count(note_pk: int) -> int:
             (note_pk,),
         ).fetchone()
     return int(row[0]) if row else 0
+
+
+# Bucket mapping for attachment ZTYPEUTIs. Ground-truth from a live
+# NoteStore.sqlite scan: tables are 'com.apple.notes.table' (CRDT widget
+# rebuilt from new body — non-destructive), everything else in Z_ENT=5
+# either is destructive (image/sketch/scan/audio) or unknown (treated as
+# destructive by default). Links/hashtags/mentions live inline in the
+# protobuf body and never appear in Z_ENT=5.
+#
+# Exact UTIs we know about. Future variants:
+#   - any `public.*-image` is treated as image (prefix fallback)
+#   - any `public.*-audio` is treated as audio (prefix fallback)
+
+_UTI_BUCKETS_EXACT: dict[str, str] = {
+    # Images (destructive — body overwrite annihilates the file)
+    "public.jpeg": "image",
+    "public.png": "image",
+    "public.heic": "image",
+    "public.svg-image": "image",
+    "com.apple.notes.gallery": "scan",  # see note below — gallery groups scanned pages
+    # Sketches (destructive — PaperKit content lost on overwrite)
+    "com.apple.drawing.2": "sketch",  # legacy
+    "com.apple.paper": "sketch",  # iOS 17+ PaperKit
+    # Scans (destructive — OCR'd PDFs lost on overwrite)
+    "com.apple.notes.scan": "scan",
+    # Audio (destructive — recording lost on overwrite)
+    "public.audio": "audio",
+    "public.mpeg-4-audio": "audio",
+    "com.apple.m4a-audio": "audio",
+    # Tables (NON-destructive — rebuilt from new HTML/markdown body)
+    "com.apple.notes.table": "table",
+}
+
+# Buckets where overwriting the note body annihilates the content.
+_DESTRUCTIVE_BUCKETS = frozenset({"image", "sketch", "scan", "audio", "file"})
+
+
+def _bucket_for_uti(uti: str | None) -> str:
+    """Classify a ZTYPEUTI into a destructive/reconstructable bucket."""
+    if uti is None:
+        return "file"  # unknown → conservative (destructive)
+    if uti in _UTI_BUCKETS_EXACT:
+        return _UTI_BUCKETS_EXACT[uti]
+    # Prefix fallbacks for future image/audio variants.
+    if uti.startswith("public.") and uti.endswith("-image"):
+        return "image"
+    if uti.startswith("public.") and uti.endswith("-audio"):
+        return "audio"
+    return "file"
+
+
+def attachment_breakdown(note_pk: int) -> dict[str, dict]:
+    """Per-bucket attachment detail for a note. Returns a dict with
+    fixed keys (`image`, `sketch`, `scan`, `audio`, `file`, `table`)
+    so callers can index without missing-key handling. Each value is
+    `{count: int, destructive: bool, utis: list[str], filenames: list[str]}`.
+
+    Sourced from `Z_ENT=5` rows; ZTYPEUTI is the discriminator.
+    Links / hashtags / mentions are stored inline in the protobuf
+    body and don't appear here.
+
+    `filenames` deduplicates and drops NULLs; many attachment rows
+    (especially tables and inline images) have no filename in Apple's
+    schema.
+
+    Scan-fallback: a row with non-null `ZFALLBACKPDFGENERATION` is
+    bucketed as `scan` regardless of its ZTYPEUTI (some legacy iOS
+    versions stored scans without a distinct UTI).
+    """
+    # Initialise all 6 buckets so callers can do
+    # `attachments.by_type.audio.count` without missing-key handling.
+    buckets: dict[str, dict] = {
+        b: {
+            "count": 0,
+            "destructive": b in _DESTRUCTIVE_BUCKETS,
+            "utis": [],
+            "filenames": [],
+        }
+        for b in ("image", "sketch", "scan", "audio", "file", "table")
+    }
+    with _open() as conn:
+        rows = conn.execute(
+            "SELECT ZTYPEUTI, ZFILENAME, ZFALLBACKPDFGENERATION "
+            "FROM ZICCLOUDSYNCINGOBJECT WHERE Z_ENT = 5 AND ZNOTE = ?",
+            (note_pk,),
+        ).fetchall()
+    for row in rows:
+        uti = row[0] if row[0] else None
+        filename = row[1] if row[1] else None
+        has_pdf = row[2] is not None
+        if has_pdf:
+            bucket = "scan"
+        else:
+            bucket = _bucket_for_uti(uti)
+        b = buckets[bucket]
+        b["count"] += 1
+        if uti and uti not in b["utis"]:
+            b["utis"].append(uti)
+        if filename and filename not in b["filenames"]:
+            b["filenames"].append(filename)
+    return buckets
+
+
+def destructive_attachment_count(note_pk: int) -> int:
+    """Count of attachment rows that an AppleScript `set body` will
+    annihilate. Excludes `table` (rebuilt from new HTML/markdown body).
+
+    Use this for the update_note guard — `attachment_count` returns
+    the total including tables, which produces false positives on
+    notes that contain only a markdown table.
+    """
+    buckets = attachment_breakdown(note_pk)
+    return sum(b["count"] for name, b in buckets.items() if b["destructive"])
 
 
 def note_protobuf_blob(pk: int) -> bytes | None:

@@ -3,6 +3,46 @@ from __future__ import annotations
 from pydantic import BaseModel, Field
 
 
+class AttachmentBucket(BaseModel):
+    """One bucket of attachments classified by type.
+
+    `destructive=True` means an AppleScript `set body` overwrite will
+    annihilate the content (images, sketches, scans, audio files, and
+    unknown-type attachments). `destructive=False` means the content
+    is rebuilt from the new HTML/markdown body (tables).
+    """
+
+    count: int = 0
+    destructive: bool = True
+    utis: list[str] = Field(default_factory=list)
+    filenames: list[str] = Field(default_factory=list)
+
+
+class AttachmentSummary(BaseModel):
+    """Per-note attachment summary with nested per-bucket detail.
+
+    `total_destructive` is the count that the update_note guard fires
+    on — only attachment types that get destroyed by a body overwrite.
+    `total_reconstructable` covers tables (rebuilt from the new body).
+
+    The `by_type` dict always has all six keys populated (even with
+    `count=0`) so callers can index without missing-key handling. The
+    six buckets:
+
+      - image   ← public.jpeg, public.png, public.heic, public.svg-image
+      - sketch  ← com.apple.drawing.2, com.apple.paper (PaperKit)
+      - scan    ← com.apple.notes.scan, com.apple.notes.gallery,
+                  or any row with non-null ZFALLBACKPDFGENERATION
+      - audio   ← public.audio, public.mpeg-4-audio, com.apple.m4a-audio
+      - file    ← any unknown ZTYPEUTI (user-attached PDFs, ZIPs, docs)
+      - table   ← com.apple.notes.table  (NON-destructive — only one)
+    """
+
+    total_destructive: int = 0
+    total_reconstructable: int = 0
+    by_type: dict[str, AttachmentBucket] = Field(default_factory=dict)
+
+
 class Folder(BaseModel):
     """A Notes folder with optional note count."""
 
@@ -33,7 +73,18 @@ class NoteSummary(BaseModel):
     pinned: bool = False
     locked: bool = False
     account: str | None = None
+    # Number of DESTRUCTIVE attachments (image/sketch/scan/audio/file).
+    # Tables are reconstructable from the new body and do NOT count
+    # toward this number — see `attachments_detail.by_type.table` for
+    # the raw table count.
+    # Contract shift in v1.1: this used to be the total Z_ENT=5 row
+    # count (including tables), but tables triggered false positives
+    # in the update_note guard.
     attachments: int = 0
+    # Optional nested breakdown — populated by get_note / list_notes
+    # paths that opt in. None for list contexts that want a lightweight
+    # row.
+    attachments_detail: "AttachmentSummary | None" = None
     shared: bool = False  # CloudKit shared note — owner can edit/delete; read-only participants silently fail
 
     # Semantic / hybrid search additions (v1.1). All None for lexical paths.
@@ -68,7 +119,12 @@ class NoteDetail(BaseModel):
     pinned: bool = False
     locked: bool = False
     account: str | None = None
+    # Destructive-only attachment count (image/sketch/scan/audio/file).
+    # Contract shift in v1.1 — see NoteSummary.attachments above.
     attachments: int = 0
+    # Nested per-type breakdown so the model can distinguish e.g.
+    # "1 image" from "1 table" instead of seeing a bare "1".
+    attachments_detail: "AttachmentSummary | None" = None
     shared: bool = False  # CloudKit shared note — owner can edit/delete; read-only participants silently fail
 
 

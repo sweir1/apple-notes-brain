@@ -25,6 +25,8 @@ from . import sqlite_reader as db
 from .html_text import count_matches, html_to_text, snippets
 from .markdown import html_to_markdown, markdown_to_html
 from .schemas import (
+    AttachmentBucket,
+    AttachmentSummary,
     Folder,
     ListPage,
     MutationResult,
@@ -211,6 +213,33 @@ def _iso_to_core_data_epoch(iso: str | None) -> float | None:
 # ---------------------------------------------------------------------------
 # Internal helpers
 # ---------------------------------------------------------------------------
+
+def _build_attachment_summary(pk: int) -> AttachmentSummary:
+    """Pull `attachment_breakdown` from the SQL layer and wrap it in the
+    `AttachmentSummary` schema with the destructive/reconstructable
+    totals computed."""
+    raw = db.attachment_breakdown(pk)
+    by_type: dict[str, AttachmentBucket] = {}
+    destructive = 0
+    reconstructable = 0
+    for bucket_name, bucket in raw.items():
+        b = AttachmentBucket(
+            count=bucket["count"],
+            destructive=bucket["destructive"],
+            utis=bucket["utis"],
+            filenames=bucket["filenames"],
+        )
+        by_type[bucket_name] = b
+        if b.destructive:
+            destructive += b.count
+        else:
+            reconstructable += b.count
+    return AttachmentSummary(
+        total_destructive=destructive,
+        total_reconstructable=reconstructable,
+        by_type=by_type,
+    )
+
 
 def _fmt_time(epoch: float) -> str:
     if not epoch:
@@ -956,6 +985,7 @@ def _get_note_applescript(pk: int, format: BodyFormat) -> NoteDetail:
     body_html = aps.UNIT_SEP.join(parts[4:])
 
     fmap = _folder_name_map(_folders_with_overlays())
+    summary = _build_attachment_summary(pk)
     return NoteDetail(
         id=db.short_id(pk),
         title=meta.get("title") or "",
@@ -965,7 +995,8 @@ def _get_note_applescript(pk: int, format: BodyFormat) -> NoteDetail:
         format=format,
         pinned=bool(meta.get("pinned")),
         locked=False,
-        attachments=db.attachment_count(pk),
+        attachments=summary.total_destructive,
+        attachments_detail=summary,
         shared=bool(meta.get("shared")),
     )
 
@@ -1149,19 +1180,31 @@ def update_note(
     if not meta:
         raise ValueError(f"note not found: {note_id!r}")
 
-    # SAFETY: AppleScript's `set body of note` silently deletes every attachment
-    # (images, sketches, scans, PDFs) on the note. Refuse unless caller explicitly
-    # acknowledges the loss. Append mode has the same underlying behaviour.
+    # SAFETY: AppleScript's `set body of note` silently deletes every
+    # *destructive* attachment (image/sketch/scan/audio/unknown-file) on the
+    # note. Tables are CRDT widgets — rebuilt from the new HTML/markdown
+    # body — so they DON'T trigger the guard. Refuse unless caller
+    # explicitly acknowledges the loss.
     # Check FIRST (before lock check) so a locked-AND-attachmented note shows
     # the more dangerous attachment warning; otherwise the user could see
     # "locked", unlock-and-retry, and silently lose attachments.
     if not allow_attachment_loss:
-        n_att = db.attachment_count(pk)
-        if n_att > 0:
+        summary = _build_attachment_summary(pk)
+        if summary.total_destructive > 0:
+            # Build a per-bucket detail string so the user/model sees
+            # exactly what types are at risk ("image: 2, sketch: 1").
+            detail = ", ".join(
+                f"{name}: {b.count}"
+                for name, b in summary.by_type.items()
+                if b.destructive and b.count > 0
+            )
             raise ValueError(
-                f"refusing to update note {note_id!r}: it has {n_att} attachment(s) which "
-                "Apple's AppleScript 'body' setter would silently delete. "
-                "Pass allow_attachment_loss=True to override (only after confirming with the user)."
+                f"refusing to update note {note_id!r}: it has "
+                f"{summary.total_destructive} destructive attachment(s) "
+                f"({detail}) which Apple's AppleScript 'body' setter would "
+                "silently delete. Pass allow_attachment_loss=True to override "
+                "(only after confirming with the user). "
+                "Note: tables don't count — they're rebuilt from the new body."
             )
 
     # Lock check AFTER attachment guard. Recoverable: user unlocks, retries.
