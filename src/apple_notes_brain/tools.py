@@ -641,7 +641,18 @@ def _folders_with_overlays(include_counts: bool = False) -> list[dict]:
     rows = db.list_folders(include_counts=include_counts)
     try:
         from . import cache as _cache
-        rows = [r for r in rows if not _cache.is_tombstoned(int(r["id"][1:]))]
+        # Tombstone check uses all three indexes (PK + (parent, name) + zid)
+        # so CloudKit-reconstituted folders that come back with a new Z_PK
+        # are still hidden during the TTL window.
+        rows = [
+            r for r in rows
+            if not _cache.is_tombstoned(
+                int(r["id"][1:]),
+                parent_pk=r.get("parent_pk"),
+                name=r.get("name"),
+                zid=r.get("zid") or r.get("z_identifier"),
+            )
+        ]
         rows = _cache.apply_rename_overlay(rows)
     except Exception:
         pass
@@ -1829,16 +1840,107 @@ def _delete_one_folder(
         return  # already gone
 
     folder_name = folder_path_for_msg.split("/")[-1] or folder_path_for_msg
+    # Capture parent PK before delete so the (parent, name) tombstone key
+    # catches CloudKit-reborn rows that come back with a new Z_PK.
+    parent_pk = None
+    try:
+        for f in db.list_folders():
+            if int(f.get("id", "f0")[1:]) == pk:
+                parent_pk = f.get("parent_pk")
+                break
+    except Exception:
+        pass
+
     ok, err = _attempt_folder_delete(folder_zid, pk, folder_name)
     if not ok:
         raise ValueError(err or f"folder {folder_path_for_msg!r} deletion verification failed")
 
     try:
         from . import cache as _cache
-        _cache.tombstone_folder(pk)
+        # Tombstone by (PK, parent+name, zid) — catches CloudKit reborn rows
+        # with a new Z_PK that share the same name + parent.
+        _cache.tombstone_folder(pk, parent_pk=parent_pk, name=folder_name, zid=folder_zid)
         _cache.sync_after_write()
     except Exception:
         pass
+
+    # Auto-retry by path: CloudKit can reconstitute a deleted folder as a
+    # new SQLite row with a fresh Z_PK within ~5s of the delete (per Apple
+    # Discussions #7647836). The tombstone catches the row at the list_folders
+    # layer for the TTL window, but the row IS in SQLite — so a subsequent
+    # list_folders bypass (e.g. another tool reading directly) would see it.
+    # Re-issue the delete up to 3x with exponential backoff to clean up the
+    # reborn row at source. Only triggers on rows with a DIFFERENT Z_PK or
+    # ZIDENTIFIER from the one we just deleted (so this never re-deletes the
+    # row whose verify is just running slow).
+    _retry_delete_on_reappearance(
+        folder_name, parent_pk, folder_path_for_msg,
+        deleted_pk=pk, deleted_zid=folder_zid,
+    )
+
+
+def _retry_delete_on_reappearance(
+    folder_name: str,
+    parent_pk: int | None,
+    folder_path_for_msg: str,
+    *,
+    deleted_pk: int,
+    deleted_zid: str,
+    max_attempts: int = 3,
+) -> None:
+    """If a folder with the same name + parent and a DIFFERENT PK/ZID
+    reappears post-delete (CloudKit reconstitution), re-issue the delete.
+    Exponential backoff starting at 1s. Silent on success; does NOT raise
+    on final failure — the tombstone is still in effect at the cache layer
+    so user-visible behaviour is preserved."""
+    backoff_s = 1.0
+    for attempt in range(max_attempts):
+        time.sleep(backoff_s)
+        backoff_s *= 2
+        try:
+            current_rows = db.list_folders()
+        except Exception:
+            return
+        candidate = None
+        for row in current_rows:
+            row_name = row.get("name", "")
+            row_parent = row.get("parent_pk")
+            try:
+                row_pk = int(row.get("id", "f0")[1:])
+            except (ValueError, TypeError):
+                continue
+            # Skip the row we just deleted — its delete may still be
+            # propagating to SQLite. We only want a CloudKit-reborn row
+            # with a different PK.
+            if row_pk == deleted_pk:
+                continue
+            if (
+                row_name.strip().lower() == folder_name.strip().lower()
+                and row_parent == parent_pk
+            ):
+                candidate = (row_pk, row)
+                break
+        if candidate is None:
+            return  # no reborn row, nothing to retry
+        reborn_pk, _row = candidate
+        reborn_zid = db.folder_zid_by_pk(reborn_pk)
+        if reborn_zid is None or reborn_zid == deleted_zid:
+            # Either gone already or it's somehow still the same row.
+            return
+        ok, _err = _attempt_folder_delete(
+            reborn_zid, reborn_pk, folder_name, timeout_s=5.0,
+        )
+        try:
+            from . import cache as _cache
+            _cache.tombstone_folder(
+                reborn_pk, parent_pk=parent_pk, name=folder_name, zid=reborn_zid,
+            )
+        except Exception:
+            pass
+        if ok:
+            return  # cleaned up
+    # Final attempt failed; the cache-layer tombstone keeps the folder
+    # hidden for the rest of the TTL window. Not a hard failure.
 
 
 _RECURSIVE_DEPTH_CAP = 8
