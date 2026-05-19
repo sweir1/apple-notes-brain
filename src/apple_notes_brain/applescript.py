@@ -1,6 +1,23 @@
-"""Thin wrapper around `osascript` for running AppleScript from Python."""
+"""Thin wrapper around `osascript` for running AppleScript from Python.
+
+Defence-in-depth against the "wedged server" failure mode:
+  - Every `run()` call uses a hard wall-clock timeout via `subprocess.run`'s
+    own `timeout=` argument. On expiry we kill the osascript process group
+    (in case it spawned children — Notes.app's AS host has been observed to
+    fork internally), then raise `AppleScriptTimeoutError`. We NEVER let
+    `subprocess.TimeoutExpired` propagate, because callers and the outer
+    `@_safe_tool` decorator catch `AppleScriptError` specifically.
+  - Default timeout is conservative (30s) — large enough to absorb
+    well-behaved write-path commits including the Notes.app→CloudKit
+    save pipeline, small enough that one stuck call cannot wedge the
+    MCP event loop indefinitely.
+  - Read-only osascript calls (e.g. addressability probes) should pass
+    a lower `timeout` (~10s) since they have no excuse to hang.
+"""
 from __future__ import annotations
 
+import os
+import signal
 import subprocess
 
 # Delimiters used inside AppleScript output. AppleScript emits these via
@@ -9,9 +26,29 @@ import subprocess
 RECORD_SEP = "\x1e"
 UNIT_SEP = "\x1f"
 
+# Default wall-clock cap on any osascript invocation. Write-path commands
+# (create/update/move/rename/delete) are the slowest because Notes.app's
+# CoreData→CloudKit save pipeline runs inline; 30s comfortably accommodates
+# the observed worst-case write under iCloud backpressure. Read-only probes
+# should pass a shorter override.
+DEFAULT_TIMEOUT = 30.0
+# Suggested override for read-only AppleScript pings (existence probes,
+# addressability checks). They have no IO and should never legitimately
+# take more than a few seconds.
+READ_ONLY_TIMEOUT = 10.0
+
 
 class AppleScriptError(RuntimeError):
-    """Raised when osascript exits non-zero or times out."""
+    """Raised when osascript exits non-zero."""
+
+
+class AppleScriptTimeoutError(AppleScriptError):
+    """Raised when osascript exceeds its wall-clock timeout.
+
+    Distinct from AppleScriptError so callers can choose to retry or surface
+    a more specific message. Inherits from AppleScriptError so blanket
+    `except AppleScriptError` paths still catch it without code changes.
+    """
 
 
 def quote(s: str) -> str:
@@ -24,23 +61,83 @@ def as_list(items: list[str]) -> str:
     return "{" + ", ".join(quote(x) for x in items) + "}"
 
 
-def run(script: str, timeout: float = 60.0) -> str:
-    """Run an AppleScript and return stdout. Raises AppleScriptError on failure."""
+def _kill_process_group(proc: subprocess.Popen) -> None:
+    """Best-effort: kill the osascript process group so any child processes
+    forked by Notes.app's AppleScript host don't survive.
+
+    Silent on every failure — by the time we get here the parent is already
+    in trouble and we just want to clean up what we can."""
     try:
-        result = subprocess.run(
+        # On POSIX we created the child in its own process group via
+        # `start_new_session=True` below; kill the whole group via -pid.
+        os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+    except (ProcessLookupError, PermissionError, OSError):
+        pass
+    try:
+        proc.kill()
+    except (ProcessLookupError, OSError):
+        pass
+    try:
+        proc.wait(timeout=1.0)
+    except (subprocess.TimeoutExpired, OSError):
+        pass
+
+
+def run(script: str, timeout: float | None = None) -> str:
+    """Run an AppleScript and return stdout.
+
+    Args:
+        script: the AppleScript source to feed osascript via stdin.
+        timeout: wall-clock seconds before we kill the process group and
+            raise. Default `DEFAULT_TIMEOUT` (30s). Pass `READ_ONLY_TIMEOUT`
+            (10s) or lower for pure read probes.
+
+    Raises:
+        AppleScriptTimeoutError: timeout exceeded; process group has been
+            killed.
+        AppleScriptError: osascript returned a non-zero exit status.
+    """
+    if timeout is None:
+        timeout = DEFAULT_TIMEOUT
+    # Use Popen + communicate so we can explicitly kill the process group on
+    # timeout (subprocess.run also does this but doesn't expose the group
+    # semantics on macOS reliably across Python versions). start_new_session
+    # puts the child in a fresh process group so SIGKILL reaches any
+    # osascript-spawned helpers.
+    try:
+        proc = subprocess.Popen(  # noqa: S603 — osascript is trusted
             ["osascript", "-"],
-            input=script,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
             text=True,
-            capture_output=True,
-            timeout=timeout,
+            start_new_session=True,
         )
+    except OSError as exc:
+        raise AppleScriptError(f"failed to launch osascript: {exc}") from exc
+
+    try:
+        stdout, stderr = proc.communicate(input=script, timeout=timeout)
     except subprocess.TimeoutExpired as exc:
-        raise AppleScriptError(f"osascript timed out after {timeout}s") from exc
-    if result.returncode != 0:
+        _kill_process_group(proc)
+        # Drain any output that did emerge so the pipes close.
+        try:
+            proc.communicate(timeout=1.0)
+        except (subprocess.TimeoutExpired, OSError, ValueError):
+            pass
+        raise AppleScriptTimeoutError(
+            f"osascript timed out after {timeout}s (process group killed)"
+        ) from exc
+    except Exception:
+        # Any other communicate() failure — make sure we don't leak the child.
+        _kill_process_group(proc)
+        raise
+
+    if proc.returncode != 0:
         raise AppleScriptError(
-            f"osascript failed (exit {result.returncode}): {result.stderr.strip()}"
+            f"osascript failed (exit {proc.returncode}): {(stderr or '').strip()}"
         )
-    return result.stdout
+    return stdout or ""
 
 
 def parse_records(output: str) -> list[list[str]]:
