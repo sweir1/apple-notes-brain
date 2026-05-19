@@ -744,23 +744,27 @@ def test_semantic_search_default_excludes_trash(state):
     assert "zid-tomb" not in ids
 
 
-def test_semantic_search_include_trash_true_returns_trash(state):
-    from apple_notes_brain.semantic.source import NoteRecord
+def test_semantic_search_does_not_accept_include_trash_kwarg(state):
+    """v1.1 Phase 5: the include_trash param was removed from the
+    semantic API surface. Calling with the kwarg must error rather
+    than silently include trash."""
+    import inspect
 
-    trash_rec = NoteRecord(
-        z_identifier="zid-tomb", z_pk=999, title="Tombstone",
-        folder="Recently Deleted", modified_at=1700000000,
-        locked=False, pinned=False,
-    )
-    state.source.add(trash_rec, "Pasta with garlic, olive oil — old recipe.")
-    state.indexer.index_all(state.source, include_trash=True)
-    out = tools_semantic.semantic_search(
-        "pasta garlic olive", limit=10, include_trash=True,
-    )
-    # Track A's id normalisation: `id` is `p<z_pk>` (short form),
-    # ZIDENTIFIER lives on `z_identifier`.
-    z_ids = [r.z_identifier for r in out.results]
-    assert "zid-tomb" in z_ids
+    sig = inspect.signature(tools_semantic.semantic_search)
+    assert "include_trash" not in sig.parameters
+    # And actually calling with it raises TypeError.
+    with pytest.raises(TypeError):
+        tools_semantic.semantic_search("x", include_trash=True)  # type: ignore[call-arg]
+
+
+def test_hybrid_search_does_not_accept_include_trash_kwarg(state):
+    """v1.1 Phase 5: same removal applies to hybrid_search."""
+    import inspect
+
+    sig = inspect.signature(tools_semantic.hybrid_search)
+    assert "include_trash" not in sig.parameters
+    with pytest.raises(TypeError):
+        tools_semantic.hybrid_search("x", include_trash=True)  # type: ignore[call-arg]
 
 
 def test_hybrid_search_default_excludes_trash(state):

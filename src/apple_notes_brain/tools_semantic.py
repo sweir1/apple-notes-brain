@@ -302,13 +302,15 @@ def semantic_search(
     query: str,
     limit: int = 20,
     unique: Literal["notes", "chunks"] = "notes",
-    include_trash: bool = False,
 ) -> SearchPage | dict[str, Any]:
     """Semantic chunk-level search. Returns the same envelope shape as
     `search_notes` so callers can swap one for the other.
 
-    `include_trash=False` (the default) excludes results from Apple's
-    'Recently Deleted' folder. Matches the lexical search defaults.
+    Notes in Recently Deleted (trash) are never returned. They aren't
+    indexed in the first place — even if you trash a note that was
+    previously indexed, the next pass removes its chunks from the store.
+    Use `search_notes(include_trash=True)` if you need to grep trash for
+    a recoverable note (lexical only).
     """
     if not HAVE_SEMANTIC:
         return _missing()
@@ -320,7 +322,7 @@ def semantic_search(
     limit = max(1, min(int(limit), 100))
     state = get_state()
     hits = state.search.semantic_chunks(
-        query, limit=limit, unique=unique, include_trash=include_trash,
+        query, limit=limit, unique=unique,
     )
     summaries = [_to_note_summary(state, h) for h in hits]
     _enrich_with_node_metadata(state, summaries)
@@ -339,13 +341,12 @@ def hybrid_search(
     query: str,
     limit: int = 20,
     unique: Literal["notes", "chunks"] = "notes",
-    include_trash: bool = False,
 ) -> SearchPage | dict[str, Any]:
     """RRF-fused semantic + lexical search. Higher-quality default for
     most queries — combines lexical precision with semantic recall.
 
-    `include_trash=False` (the default) excludes results from Apple's
-    'Recently Deleted' folder.
+    Notes in Recently Deleted (trash) are never returned (same policy
+    as `semantic_search`).
 
     Each result's `semantic_score`, `lexical_score`, and `fused_score`
     fields carry strict provenance:
@@ -366,7 +367,7 @@ def hybrid_search(
     limit = max(1, min(int(limit), 100))
     state = get_state()
     hits = state.search.hybrid(
-        query, limit=limit, unique=unique, include_trash=include_trash,
+        query, limit=limit, unique=unique,
     )
     summaries = [_to_note_summary(state, h) for h in hits]
     _enrich_with_node_metadata(state, summaries)

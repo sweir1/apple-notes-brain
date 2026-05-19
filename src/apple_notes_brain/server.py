@@ -180,7 +180,6 @@ def semantic_search(
     query: str,
     limit: int = 20,
     unique: str = "notes",
-    include_trash: bool = False,
 ) -> SearchPage | dict:
     """Embedding-based semantic search over chunked note bodies.
 
@@ -193,14 +192,16 @@ def semantic_search(
     - unique: 'notes' (default, dedups multi-chunk hits per note,
        keeping the highest-scoring chunk) or 'chunks' (chunk-grained,
        returns every match).
-    - include_trash: default False (excludes Apple's 'Recently Deleted'
-       folder). Matches list_notes / search_notes defaults.
+
+    Notes in Recently Deleted (trash) are never returned — they aren't
+    indexed and there's no opt-in. Use `search_notes(include_trash=True)`
+    if you need to grep trash lexically for a recoverable note.
 
     Requires the [semantic] install extra (ONNX runtime + tokenizers +
     sqlite-vec). Without it, returns a `missing-extras` error envelope.
     """
     return tools_semantic.semantic_search(
-        query, limit=limit, unique=unique, include_trash=include_trash,
+        query, limit=limit, unique=unique,
     )  # type: ignore[arg-type]
 
 
@@ -209,7 +210,6 @@ def hybrid_search(
     query: str,
     limit: int = 20,
     unique: str = "notes",
-    include_trash: bool = False,
 ) -> SearchPage | dict:
     """Reciprocal-rank-fused semantic + lexical search. Higher recall
     than either alone for most queries.
@@ -227,10 +227,11 @@ def hybrid_search(
         rankers. Always set on hybrid results; this is what the result
         list is sorted by, descending.
 
-    `include_trash`: default False (excludes Apple's 'Recently Deleted').
+    Notes in Recently Deleted (trash) are never returned (same policy
+    as `semantic_search`).
     """
     return tools_semantic.hybrid_search(
-        query, limit=limit, unique=unique, include_trash=include_trash,
+        query, limit=limit, unique=unique,
     )  # type: ignore[arg-type]
 
 
